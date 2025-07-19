@@ -5,5 +5,5 @@
 azure-functions>=1.18.0
 openai>=1.0.0
 httpx>=0.25.0
-azure-durable-functions
+azure-functions-durable
 
