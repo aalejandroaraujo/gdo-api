@@ -124,7 +124,7 @@ def evaluate_intake_progress(req: func.HttpRequest) -> func.HttpResponse:
 @app.function_name("ExtractFieldsFromInput")
 @app.route(route="extract_fields_from_input", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 async def extract_fields_from_input(req: func.HttpRequest) -> func.HttpResponse:
-    """Extract structured fields from user messages using OpenAI gpt-4o-mini."""
+    """Extract structured fields from user messages using OpenAI gpt-4.1-mini."""
     try:
         try:
             req_body = req.get_json()
@@ -152,7 +152,7 @@ async def extract_fields_from_input(req: func.HttpRequest) -> func.HttpResponse:
         client = get_openai_client()
 
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": message}
@@ -357,7 +357,7 @@ async def switch_chat_mode(req: func.HttpRequest) -> func.HttpResponse:
         system_prompt = "You are a conversation controller for a mental health assistant. Based on the user message, decide the mode: intake, advice, reflection, or summary. Only return one word."
 
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": context}

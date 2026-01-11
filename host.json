@@ -4,6 +4,9 @@
   "extensions": {
     "durableTask": {
       "hubName": "TestTaskHub"
+    },
+    "http": {
+      "routePrefix": "api"
     }
   }
 }

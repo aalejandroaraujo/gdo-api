@@ -8,7 +8,7 @@ Base URL: `https://<your-function-app>.azurewebsites.net/api`
 
 ## extract_fields_from_input
 
-Extracts structured mental health data from natural language using OpenAI.
+Extracts structured mental health data from natural language using OpenAI gpt-4.1-mini.
 
 **Endpoint:** `POST /api/extract_fields_from_input`
 
@@ -78,7 +78,7 @@ Safety screening using OpenAI moderation API.
 
 ## switch_chat_mode
 
-Determines conversation state using AI analysis.
+Determines conversation state using AI analysis (gpt-4.1-mini).
 
 **Endpoint:** `POST /api/switch_chat_mode`
 

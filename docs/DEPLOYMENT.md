@@ -37,11 +37,14 @@ cat > local.settings.json << SETTINGS
     "FUNCTIONS_WORKER_RUNTIME": "python",
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
     "OPENAI_API_KEY": "your-key-here"
+  },
+  "Host": {
+    "LocalHttpPort": 9090
   }
 }
 SETTINGS
 
-# Run locally
+# Run locally (will start on port 9090)
 func start
 ```
 
@@ -109,6 +112,9 @@ az functionapp config container set \
   "extensions": {
     "durableTask": {
       "hubName": "TestTaskHub"
+    },
+    "http": {
+      "routePrefix": "api"
     }
   }
 }
