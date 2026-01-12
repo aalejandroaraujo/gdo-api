@@ -2,19 +2,57 @@
 
 ## Overview
 
-This platform provides backend services for a mental health chatbot. It uses Azure Durable Functions for orchestration and OpenAI for NLP capabilities.
+This platform provides backend services for a mental health chatbot. It uses Azure Durable Functions for orchestration, OpenAI for NLP capabilities, and PostgreSQL for data persistence.
 
 ## System Design
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────┐
-│  Chatbot Client │────▶│  Azure Functions │────▶│   OpenAI    │
+│  Mobile App /   │────▶│  Azure Functions │────▶│   OpenAI    │
+│  Chatbot Client │     │  (with Auth)     │     │  gpt-4.1    │
 └─────────────────┘     └──────────────────┘     └─────────────┘
-                               │
-                               ▼
-                        ┌─────────────┐
-                        │   NocoDB    │
-                        └─────────────┘
+        │                       │
+        │                       ▼
+        │               ┌─────────────┐
+        │               │ PostgreSQL  │
+        │               │ (Azure)     │
+        │               └─────────────┘
+        │                       │
+        ▼                       ▼
+   ┌─────────────────────────────────────┐
+   │          Azure Key Vault            │
+   │  (JWT Key, DB Password, API Keys)   │
+   └─────────────────────────────────────┘
+```
+
+## Authentication Flow
+
+```
+Client Request
+     │
+     ▼
+┌────────────────────┐
+│ Authorization:     │
+│ Bearer <JWT>       │
+└────────────────────┘
+     │
+     ▼
+┌────────────────────┐
+│ Auth Middleware    │  Validate JWT signature & expiration
+│ @require_auth      │  Extract user claims (sub, iat, exp)
+└────────────────────┘
+     │
+     ├─── Invalid ──▶ 401 Unauthorized
+     │
+     ▼ Valid
+┌────────────────────┐
+│ req.user = payload │  Attach user to request
+└────────────────────┘
+     │
+     ▼
+┌────────────────────┐
+│ Business Logic     │  Protected endpoint executes
+└────────────────────┘
 ```
 
 ## Data Flow
@@ -44,7 +82,7 @@ User Message
      │
      ▼
 ┌────────────────────┐
-│ save_session       │  Persist to database
+│ save_session       │  Persist to PostgreSQL
 └────────────────────┘
 ```
 
@@ -62,7 +100,7 @@ The system tracks 7 dimensions with weighted scoring:
 | frequency | 1 | How often symptoms occur |
 | coping_mechanisms | 1 | Current strategies used |
 
-**Total possible:** 12 points  
+**Total possible:** 12 points
 **Threshold:** 6 points = sufficient data collected
 
 ## Conversation Modes
@@ -80,20 +118,57 @@ The system tracks 7 dimensions with weighted scoring:
 |-----------|------------|
 | Runtime | Python 3.11+ |
 | Framework | Azure Functions v2 (decorator model) |
-| AI | OpenAI gpt-4o-mini, Moderation API |
-| Database | NocoDB |
-| Deployment | Docker, Azure Container Registry |
+| AI | OpenAI gpt-4.1-mini, Moderation API |
+| Database | Azure PostgreSQL Flexible Server |
+| Auth | Self-signed JWT (PyJWT) |
+| Secrets | Azure Key Vault |
+| Deployment | Azure (Switzerland North region) |
+
+## Azure Infrastructure
+
+| Resource | Name | Purpose |
+|----------|------|---------|
+| Resource Group | rg-gdo-health-prod | Container for all resources |
+| PostgreSQL | psql-gdo-health-prod | Session and user data storage |
+| Key Vault | kv-gdo-health-prod | Secrets management |
+| Storage Account | stgdohealthprod | Durable Functions state |
+| Function App | func-gdo-health-prod | API hosting |
 
 ## File Structure
 
 ```
 function_app.py          # All function definitions
 src/
+  auth/
+    __init__.py          # Auth module exports
+    middleware.py        # JWT validation & @require_auth decorator
   shared/
-    common.py            # OpenAI client, NocoDB persistence
+    common.py            # OpenAI client, database persistence
     storage.py           # Storage utilities
+infrastructure/
+  deploy-gdo-health.sh   # Azure deployment script
+  schema.sql             # PostgreSQL schema
+docs/
+  API.md                 # API reference
+  ARCHITECTURE.md        # This file
+  roadmap/               # Development phases
 host.json                # Azure Functions configuration
+local.settings.json      # Local dev configuration
 ```
+
+## Database Schema
+
+PostgreSQL with 7 tables:
+
+- `users` - User accounts
+- `sessions` - Chat sessions per user
+- `messages` - Individual messages in sessions
+- `extracted_fields` - Structured intake data
+- `risk_flags` - Safety screening results
+- `session_summaries` - AI-generated session summaries
+- `audit_log` - Security and compliance logging
+
+Extensions enabled: `uuid-ossp`, `pgcrypto`
 
 ## Orchestrators
 
@@ -103,3 +178,15 @@ Two orchestrators are available:
 2. **minimal_orchestrator** - Simple test for environment verification
 
 Orchestrators use 3-attempt retry with 5-second intervals.
+
+## Security
+
+- **Authentication:** JWT Bearer tokens required for all protected endpoints
+- **Token Expiration:** 24 hours
+- **Secrets:** Stored in Azure Key Vault with managed identity access
+- **HTTPS:** Enforced by Azure Functions
+- **Database:** SSL required, credentials in Key Vault
+
+---
+
+*See [roadmap/](roadmap/) for development phases and migration plans.*

@@ -40,6 +40,9 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Feature flags
+PSQL_AVAILABLE=false
+
 #-------------------------------------------------------------------------------
 # HELPER FUNCTIONS
 #-------------------------------------------------------------------------------
@@ -122,10 +125,25 @@ preflight_checks() {
     # Check required commands
     log INFO "Checking required tools..."
     check_command "az"
-    check_command "psql"
     check_command "curl"
-    check_command "jq"
-    log OK "All required tools found"
+    log OK "Required tools found (az, curl)"
+
+    # jq is optional - we use az --query instead where possible
+    if command -v jq &> /dev/null; then
+        log OK "jq found (optional)"
+    else
+        log WARN "jq not found (optional) - using az --query instead"
+    fi
+
+    # psql is optional - schema can be applied later
+    if command -v psql &> /dev/null; then
+        PSQL_AVAILABLE=true
+        log OK "psql found - schema will be applied automatically"
+    else
+        PSQL_AVAILABLE=false
+        log WARN "psql not found - schema will be generated but not applied automatically"
+        log WARN "You can apply schema later via Azure Cloud Shell or after installing psql"
+    fi
     
     # Check environment file
     if [ ! -f "$ENV_FILE" ]; then
@@ -190,14 +208,9 @@ preflight_checks() {
     fi
     log OK "Location validated"
     
-    # Check if resource group already exists
+    # Check if resource group already exists (just warn, continue automatically for idempotent reruns)
     if az group show --name "$RESOURCE_GROUP" &>/dev/null; then
-        log WARN "Resource group '$RESOURCE_GROUP' already exists!"
-        read -p "Continue with existing resource group? (y/N) " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            error_exit "Deployment cancelled by user"
-        fi
+        log WARN "Resource group '$RESOURCE_GROUP' already exists - continuing with existing resources"
     fi
     
     log OK "Pre-flight checks completed"
@@ -651,18 +664,24 @@ END $$;
 EOSQL
 
     log OK "Schema file generated: $SCHEMA_FILE"
-    
-    # Apply schema
-    log INFO "Applying schema to PostgreSQL..."
-    export PGPASSWORD="$POSTGRES_ADMIN_PASSWORD"
-    
-    if psql -h "$POSTGRES_HOST" -U "$POSTGRES_ADMIN_USER" -d "$POSTGRES_DB" -f "$SCHEMA_FILE" >> "$LOG_FILE" 2>&1; then
-        log OK "Database schema applied successfully"
+
+    # Apply schema (only if psql is available)
+    if [ "$PSQL_AVAILABLE" = true ]; then
+        log INFO "Applying schema to PostgreSQL..."
+        export PGPASSWORD="$POSTGRES_ADMIN_PASSWORD"
+
+        if psql -h "$POSTGRES_HOST" -U "$POSTGRES_ADMIN_USER" -d "$POSTGRES_DB" -f "$SCHEMA_FILE" >> "$LOG_FILE" 2>&1; then
+            log OK "Database schema applied successfully"
+        else
+            error_exit "Failed to apply database schema. Check log file for details."
+        fi
+
+        unset PGPASSWORD
     else
-        error_exit "Failed to apply database schema. Check log file for details."
+        log WARN "Skipping schema application (psql not available)"
+        log INFO "To apply schema manually, run in Azure Cloud Shell:"
+        log INFO "  psql -h $POSTGRES_HOST -U $POSTGRES_ADMIN_USER -d $POSTGRES_DB -f schema.sql"
     fi
-    
-    unset PGPASSWORD
 }
 
 #-------------------------------------------------------------------------------

@@ -5,6 +5,7 @@ v2 decorator model implementation consolidating all functions.
 
 Functions:
 - test_function: Health check endpoint
+- get_dev_token: Development token endpoint (Phase 1 auth)
 - evaluate_intake_progress: Scores collected intake data
 - extract_fields_from_input: Extracts structured fields using OpenAI
 - risk_escalation_check: Safety screening via OpenAI moderation
@@ -16,12 +17,14 @@ Functions:
 
 import json
 import logging
+import os
 from datetime import timedelta
 
 import azure.functions as func
 import azure.durable_functions as df
 
 from src.shared.common import get_openai_client, nocodb_upsert
+from src.auth import require_auth, create_token, AuthError
 
 
 # Create the Durable Functions app instance
@@ -33,15 +36,76 @@ app = df.DFApp()
 # =============================================================================
 
 @app.function_name("TestFunction")
-@app.route(route="test", methods=["GET"])
+@app.route(route="test", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
 def test_function(req: func.HttpRequest) -> func.HttpResponse:
     """Health check endpoint to verify Azure Functions detection."""
     return func.HttpResponse("Hello World! Function detected successfully!")
 
 
+@app.function_name("GetDevToken")
+@app.route(route="auth/dev-token", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+def get_dev_token(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Development token endpoint for testing authentication.
+
+    WARNING: This endpoint should be disabled or restricted in production.
+    It allows generating tokens for any user_id without verification.
+
+    Request body:
+        {"user_id": "test-user-123"}
+
+    Response:
+        {"token": "eyJ...", "expires_in": 86400, "token_type": "Bearer"}
+    """
+    # Check if dev tokens are enabled (default: enabled for now)
+    if os.environ.get("DISABLE_DEV_TOKENS", "").lower() == "true":
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Dev tokens are disabled"}),
+            status_code=403,
+            mimetype="application/json"
+        )
+
+    try:
+        req_body = req.get_json()
+    except ValueError:
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Invalid JSON"}),
+            status_code=400,
+            mimetype="application/json"
+        )
+
+    user_id = req_body.get("user_id") if req_body else None
+
+    if not user_id or not isinstance(user_id, str) or not user_id.strip():
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "user_id is required"}),
+            status_code=400,
+            mimetype="application/json"
+        )
+
+    try:
+        token = create_token(user_id.strip())
+        return func.HttpResponse(
+            json.dumps({
+                "token": token,
+                "expires_in": 86400,
+                "token_type": "Bearer"
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+    except AuthError as e:
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": e.message}),
+            status_code=e.status_code,
+            mimetype="application/json"
+        )
+
+
 @app.function_name("EvaluateIntakeProgress")
-@app.route(route="evaluate_intake_progress", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
-def evaluate_intake_progress(req: func.HttpRequest) -> func.HttpResponse:
+@app.route(route="evaluate_intake_progress", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+@require_auth
+async def evaluate_intake_progress(req: func.HttpRequest) -> func.HttpResponse:
     """
     Evaluate intake progress based on collected fields.
     Calculates a weighted score and determines if enough data has been collected.
@@ -122,7 +186,8 @@ def evaluate_intake_progress(req: func.HttpRequest) -> func.HttpResponse:
 
 
 @app.function_name("ExtractFieldsFromInput")
-@app.route(route="extract_fields_from_input", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+@app.route(route="extract_fields_from_input", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+@require_auth
 async def extract_fields_from_input(req: func.HttpRequest) -> func.HttpResponse:
     """Extract structured fields from user messages using OpenAI gpt-4.1-mini."""
     try:
@@ -181,7 +246,8 @@ async def extract_fields_from_input(req: func.HttpRequest) -> func.HttpResponse:
 
 
 @app.function_name("RiskEscalationCheck")
-@app.route(route="risk_escalation_check", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+@app.route(route="risk_escalation_check", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+@require_auth
 async def risk_escalation_check(req: func.HttpRequest) -> func.HttpResponse:
     """Evaluate user messages using OpenAI moderation endpoint for safety screening."""
     try:
@@ -252,7 +318,8 @@ async def risk_escalation_check(req: func.HttpRequest) -> func.HttpResponse:
 
 
 @app.function_name("SaveSessionSummary")
-@app.route(route="save_session_summary", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+@app.route(route="save_session_summary", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+@require_auth
 async def save_session_summary(req: func.HttpRequest) -> func.HttpResponse:
     """Save session summary to NocoDB."""
     logging.info('Processing save_session_summary request')
@@ -323,7 +390,8 @@ async def save_session_summary(req: func.HttpRequest) -> func.HttpResponse:
 
 
 @app.function_name("SwitchChatMode")
-@app.route(route="switch_chat_mode", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+@app.route(route="switch_chat_mode", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+@require_auth
 async def switch_chat_mode(req: func.HttpRequest) -> func.HttpResponse:
     """Determine chat mode switch using OpenAI analysis."""
     try:
@@ -448,8 +516,9 @@ def minimal_orchestrator(context: df.DurableOrchestrationContext):
 # =============================================================================
 
 @app.function_name("StartOrchestration")
-@app.route(route="orchestrators/{function_name}", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+@app.route(route="orchestrators/{function_name}", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 @app.durable_client_input(client_name="client")
+@require_auth
 async def start_orchestration(req: func.HttpRequest, client: df.DurableOrchestrationClient) -> func.HttpResponse:
     """HTTP starter for durable orchestrations."""
     function_name = req.route_params.get('function_name')

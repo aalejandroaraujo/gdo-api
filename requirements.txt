@@ -6,3 +6,5 @@ azure-functions
 azure-functions-durable
 openai
 httpx
+PyJWT>=2.8.0
+asyncpg>=0.29.0
