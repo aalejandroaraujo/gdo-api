@@ -51,3 +51,10 @@ __azurite_db*__.json
 
 # IDE settings
 .claude/
+
+# Infrastructure secrets
+infrastructure/.env.gdo-health
+infrastructure/*.log
+infrastructure/deployment-info.json
+infrastructure/schema.sql
+infrastructure/verification-report-*.txt
