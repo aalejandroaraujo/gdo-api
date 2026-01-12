@@ -1,246 +1,337 @@
-# Phase 2: Function App Deployment
+# Phase 2: Function App Deployment & PostgreSQL Migration
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
 ## Objective
 
-Deploy the updated Function App code to Azure, replacing NocoDB storage with PostgreSQL and integrating the authentication middleware from Phase 1.
+Deploy the Function App to Azure and migrate data persistence from NocoDB to PostgreSQL.
+
+**Detailed Migration Plan:** [MIGRATION-PLAN.md](./MIGRATION-PLAN.md)
 
 ---
 
-## Pre-Deployment Checklist
+## Progress
 
-- [x] Infrastructure deployed (Phase 0)
-- [ ] Auth middleware implemented (Phase 1)
-- [ ] NocoDB references replaced with PostgreSQL
-- [ ] Environment variables configured
-- [ ] Local testing passed
+### Completed
+
+- [x] Auth middleware implemented (Phase 1)
+- [x] `asyncpg` and `PyJWT` added to requirements.txt
+- [x] Auth integrated into all protected endpoints
+- [x] Function App deployed to Azure
+- [x] JWT_SIGNING_KEY configured via Key Vault reference
+- [x] OPENAI_API_KEY configured via Key Vault reference
+- [x] Health endpoint verified (`/api/test`)
+- [x] Protected endpoints working with JWT tokens
+- [x] All deployment tests passed
+
+### Remaining
+
+- [ ] Create PostgreSQL client module (`src/db/`)
+- [ ] Replace NocoDB with PostgreSQL queries
+- [ ] Define and implement user registration flow
+- [ ] Test database connectivity from Function App
+- [ ] Migrate existing session data (if any)
 
 ---
 
-## Code Changes Required
+## Part A: Deployment (COMPLETE)
 
-### 1. Update `src/shared/common.py`
+### Deployment Command
 
-Replace NocoDB client with PostgreSQL:
+```bash
+func azure functionapp publish func-gdo-health-prod
+```
+
+### App Settings Configured
+
+| Setting | Source |
+|---------|--------|
+| `JWT_SIGNING_KEY` | Key Vault: `JwtSigningKey` |
+| `OPENAI_API_KEY` | Key Vault: `OpenAiApiKey` |
+| `POSTGRES_HOST` | `psql-gdo-health-prod.postgres.database.azure.com` |
+| `POSTGRES_DB` | `gdohealth` |
+| `POSTGRES_USER` | `gdoadmin` |
+| `POSTGRES_PASSWORD` | Key Vault: `PostgresPassword` |
+
+### Deployed Endpoints
+
+| Endpoint | Status |
+|----------|--------|
+| `GET /api/test` | Working |
+| `POST /api/auth/dev-token` | Working |
+| `POST /api/extract_fields_from_input` | Working (with auth) |
+| `POST /api/risk_escalation_check` | Working (with auth) |
+| `POST /api/switch_chat_mode` | Working (with auth) |
+| `POST /api/evaluate_intake_progress` | Working (with auth) |
+| `POST /api/save_session_summary` | Working (with auth) - uses NocoDB |
+
+---
+
+## Part B: PostgreSQL Migration (TODO)
+
+### Current State
+
+The `save_session_summary` endpoint currently uses NocoDB via `nocodb_upsert()` in `src/shared/common.py`. This needs to be replaced with PostgreSQL.
+
+### Step 1: Create Database Module
+
+Create `src/db/__init__.py`:
 
 ```python
-# Before (NocoDB)
-async def nocodb_upsert(session_id: str, summary: str):
-    # HTTP calls to NocoDB API
-    ...
+"""Database module for PostgreSQL connectivity."""
+from .postgres import get_pool, close_pool
+from .queries import save_session, get_session, create_user, get_user
 
-# After (PostgreSQL)
+__all__ = ["get_pool", "close_pool", "save_session", "get_session", "create_user", "get_user"]
+```
+
+Create `src/db/postgres.py`:
+
+```python
+"""PostgreSQL connection pool management."""
+import os
 import asyncpg
+from typing import Optional
 
-async def get_db_pool():
-    """Get or create database connection pool."""
-    return await asyncpg.create_pool(
-        host=os.environ["POSTGRES_HOST"],
-        database=os.environ["POSTGRES_DB"],
-        user=os.environ["POSTGRES_USER"],
-        password=os.environ["POSTGRES_PASSWORD"],
-        ssl="require",
-        min_size=1,
-        max_size=10
-    )
+_pool: Optional[asyncpg.Pool] = None
 
-async def save_session_summary(session_id: str, user_id: str, summary: str):
-    """Save session summary to PostgreSQL."""
-    pool = await get_db_pool()
+async def get_pool() -> asyncpg.Pool:
+    """Get or create the database connection pool."""
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(
+            host=os.environ["POSTGRES_HOST"],
+            database=os.environ.get("POSTGRES_DB", "gdohealth"),
+            user=os.environ.get("POSTGRES_USER", "gdoadmin"),
+            password=os.environ["POSTGRES_PASSWORD"],
+            ssl="require",
+            min_size=1,
+            max_size=10
+        )
+    return _pool
+
+async def close_pool():
+    """Close the connection pool."""
+    global _pool
+    if _pool:
+        await _pool.close()
+        _pool = None
+```
+
+Create `src/db/queries.py`:
+
+```python
+"""Database query functions."""
+import uuid
+from datetime import datetime
+from typing import Optional, Dict, Any
+from .postgres import get_pool
+
+async def create_user(external_id: str, email: Optional[str] = None) -> Dict[str, Any]:
+    """Create a new user and return user data."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        user_id = uuid.uuid4()
+        row = await conn.fetchrow("""
+            INSERT INTO users (id, external_id, email, created_at)
+            VALUES ($1, $2, $3, NOW())
+            RETURNING id, external_id, email, created_at
+        """, user_id, external_id, email)
+        return dict(row)
+
+async def get_user(external_id: str) -> Optional[Dict[str, Any]]:
+    """Get user by external ID."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT id, external_id, email, created_at
+            FROM users WHERE external_id = $1
+        """, external_id)
+        return dict(row) if row else None
+
+async def get_or_create_user(external_id: str) -> Dict[str, Any]:
+    """Get existing user or create new one."""
+    user = await get_user(external_id)
+    if user:
+        return user
+    return await create_user(external_id)
+
+async def save_session(session_id: str, user_id: uuid.UUID, summary: str) -> None:
+    """Save or update session summary."""
+    pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("""
-            UPDATE sessions
-            SET summary = $1, updated_at = NOW()
-            WHERE id = $2 AND user_id = $3
-        """, summary, session_id, user_id)
+            INSERT INTO session_summaries (id, session_id, user_id, summary, created_at)
+            VALUES (gen_random_uuid(), $1, $2, $3, NOW())
+            ON CONFLICT (session_id)
+            DO UPDATE SET summary = $3, created_at = NOW()
+        """, session_id, user_id, summary[:2000])  # Truncate to 2000 chars
+
+async def get_session(session_id: str) -> Optional[Dict[str, Any]]:
+    """Get session by ID."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT s.*, ss.summary
+            FROM sessions s
+            LEFT JOIN session_summaries ss ON s.id = ss.session_id
+            WHERE s.id = $1
+        """, session_id)
+        return dict(row) if row else None
 ```
 
-### 2. Add Dependencies
+### Step 2: Update Function App
 
-Update `requirements.txt`:
+Replace NocoDB calls in `function_app.py`:
 
-```txt
-azure-functions
-azure-durable-functions
-openai>=1.0.0
-asyncpg>=0.29.0
-PyJWT>=2.8.0
+```python
+# Before
+from src.shared.common import nocodb_upsert
+
+# After
+from src.db import save_session, get_or_create_user
 ```
 
-### 3. Update Function App Settings
+### Step 3: Update save_session_summary Endpoint
 
-```bash
-source infrastructure/.env.gdo-health
+```python
+@app.function_name("SaveSessionSummary")
+@app.route(route="save_session_summary", methods=["POST"])
+@require_auth
+async def save_session_summary(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        req_body = req.get_json()
+        session_id = req_body.get("session_id")
+        summary = req_body.get("summary", "")
 
-az functionapp config appsettings set \
-    --name func-gdo-health-prod \
-    --resource-group rg-gdo-health-prod \
-    --settings \
-        "POSTGRES_HOST=@Microsoft.KeyVault(VaultName=kv-gdo-health-prod;SecretName=PostgresHost)" \
-        "POSTGRES_DB=gdohealth" \
-        "POSTGRES_USER=gdoadmin" \
-        "POSTGRES_PASSWORD=@Microsoft.KeyVault(VaultName=kv-gdo-health-prod;SecretName=PostgresPassword)" \
-        "OPENAI_API_KEY=@Microsoft.KeyVault(VaultName=kv-gdo-health-prod;SecretName=OpenAiApiKey)" \
-        "JWT_SIGNING_KEY=@Microsoft.KeyVault(VaultName=kv-gdo-health-prod;SecretName=JwtSigningKey)"
-```
+        # Get user from JWT token
+        user_id = req.user["sub"]
 
----
+        # Get or create user in database
+        user = await get_or_create_user(user_id)
 
-## Deployment Methods
+        # Save session summary
+        await save_session(session_id, user["id"], summary)
 
-### Method A: VS Code Azure Extension (Recommended)
-
-1. Install Azure Functions extension in VS Code
-2. Sign in to Azure
-3. Right-click on `func-gdo-health-prod` → Deploy to Function App
-4. Confirm deployment
-
-### Method B: Azure CLI
-
-```bash
-cd "f:/VS Projects/gdo-api"
-
-# Create deployment package
-func azure functionapp publish func-gdo-health-prod --python
-```
-
-### Method C: GitHub Actions (CI/CD)
-
-Create `.github/workflows/deploy.yml`:
-
-```yaml
-name: Deploy to Azure Functions
-
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
-
-env:
-  AZURE_FUNCTIONAPP_NAME: func-gdo-health-prod
-  PYTHON_VERSION: '3.11'
-
-jobs:
-  build-and-deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt --target=".python_packages/lib/site-packages"
-
-      - name: Deploy to Azure Functions
-        uses: Azure/functions-action@v1
-        with:
-          app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
-          package: .
-          publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
+        return func.HttpResponse(
+            json.dumps({"status": "ok"}),
+            status_code=200,
+            mimetype="application/json"
+        )
+    except Exception as e:
+        logging.error(f"Error saving session: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
 ```
 
 ---
 
-## Post-Deployment Verification
+## Part C: User Journey Design (TODO)
 
-### 1. Health Check
+### Questions to Answer
 
-```bash
-curl https://func-gdo-health-prod.azurewebsites.net/api/test
-# Expected: "Hello World! Function detected successfully!"
+1. **User Identity Source**
+   - Will users come from WordPress, mobile app, or both?
+   - Do we need to sync users between WordPress and PostgreSQL?
+
+2. **Registration Flow**
+   - Should `/auth/dev-token` create users automatically?
+   - Or should there be a separate `/auth/register` endpoint?
+
+3. **User Data**
+   - What data do we store? (email, name, preferences)
+   - What comes from WordPress vs mobile app?
+
+### Proposed Flow (Simple)
+
+```
+Mobile App First Launch
+        │
+        ▼
+Generate device UUID
+        │
+        ▼
+POST /api/auth/dev-token
+{"user_id": "device-uuid-123"}
+        │
+        ▼
+Backend: get_or_create_user()
+        │
+        ▼
+Return JWT token
+        │
+        ▼
+App stores token securely
 ```
 
-### 2. Test Protected Endpoint
+This creates "anonymous" users identified by device. Later, with Entra External ID (Phase 3), users can link their account to an email/social login.
+
+---
+
+## Verification Steps
+
+### Test Database Connectivity
 
 ```bash
-# Get a dev token first
-TOKEN=$(curl -X POST https://func-gdo-health-prod.azurewebsites.net/api/auth/dev-token \
-  -H "Content-Type: application/json" \
-  -d '{"user_id": "test-user"}' | jq -r '.token')
-
-# Call protected endpoint
-curl -X POST https://func-gdo-health-prod.azurewebsites.net/api/extract_fields_from_input \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"message": "I have been feeling anxious for 2 weeks"}'
-```
-
-### 3. Check Logs
-
-```bash
+# From Function App logs
 az functionapp log tail \
     --name func-gdo-health-prod \
     --resource-group rg-gdo-health-prod
+
+# Look for connection errors after calling save_session_summary
 ```
 
-### 4. Verify Database Connectivity
+### Test Save Session
 
 ```bash
-# Check Application Insights for any connection errors
-az monitor app-insights query \
-    --app func-gdo-health-prod \
-    --resource-group rg-gdo-health-prod \
-    --analytics-query "exceptions | take 10"
+TOKEN=$(curl -s -X POST https://func-gdo-health-prod.azurewebsites.net/api/auth/dev-token \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "test-user"}' | jq -r '.token')
+
+curl -X POST https://func-gdo-health-prod.azurewebsites.net/api/save_session_summary \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "test-123", "summary": "Test session summary"}'
 ```
 
----
-
-## Rollback Plan
-
-If deployment fails:
+### Verify in Database
 
 ```bash
-# List deployment history
-az functionapp deployment list \
-    --name func-gdo-health-prod \
-    --resource-group rg-gdo-health-prod
+psql "host=psql-gdo-health-prod.postgres.database.azure.com dbname=gdohealth user=gdoadmin sslmode=require"
 
-# Rollback to previous deployment
-az functionapp deployment source config-zip \
-    --name func-gdo-health-prod \
-    --resource-group rg-gdo-health-prod \
-    --src <previous-package.zip>
+SELECT * FROM users;
+SELECT * FROM session_summaries;
 ```
 
 ---
 
 ## Tasks Checklist
 
-- [ ] Replace NocoDB with PostgreSQL in `src/shared/common.py`
-- [ ] Add `asyncpg` and `PyJWT` to `requirements.txt`
-- [ ] Integrate auth middleware from Phase 1
-- [ ] Update all endpoints to use new auth
-- [ ] Test locally with `func start`
-- [ ] Deploy to Azure
-- [ ] Verify health endpoint
-- [ ] Verify protected endpoints with token
-- [ ] Monitor logs for errors
-- [ ] Update API documentation
+### Deployment (DONE)
+- [x] Deploy Function App to Azure
+- [x] Configure JWT_SIGNING_KEY
+- [x] Configure OPENAI_API_KEY
+- [x] Verify all endpoints working
 
----
+### PostgreSQL Migration (TODO)
+- [ ] Create `src/db/` module
+- [ ] Implement connection pool
+- [ ] Implement user queries
+- [ ] Implement session queries
+- [ ] Replace `nocodb_upsert` with PostgreSQL
+- [ ] Test locally
+- [ ] Deploy and test in Azure
+- [ ] Remove NocoDB code
 
-## Monitoring & Alerts
-
-After deployment, set up alerts:
-
-```bash
-# Create alert for function failures
-az monitor metrics alert create \
-    --name "FunctionAppFailures" \
-    --resource-group rg-gdo-health-prod \
-    --scopes "/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/rg-gdo-health-prod/providers/Microsoft.Web/sites/func-gdo-health-prod" \
-    --condition "count requests/failed > 5" \
-    --window-size 5m \
-    --evaluation-frequency 1m
-```
+### User Journey (TODO)
+- [ ] Decide on user registration approach
+- [ ] Implement user creation in `/auth/dev-token`
+- [ ] Document user flow
 
 ---
 

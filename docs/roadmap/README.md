@@ -4,7 +4,7 @@
 
 This roadmap outlines the phased approach to complete the GDO Health platform migration from Typebot to a fully Azure-native solution.
 
-**Current Status:** Phase 1 complete - JWT authentication implemented and tested
+**Current Status:** Phase 2 in progress - Function App deployed, PostgreSQL migration pending
 
 ---
 
