@@ -66,3 +66,12 @@ docs/internal/
 *.zip
 create_deploy_zip.py
 *.backup
+
+# Temp files
+tmpclaude-*
+nul
+
+# Test files (not for production)
+*_test.py
+test_*.py
+*_minimal.txt

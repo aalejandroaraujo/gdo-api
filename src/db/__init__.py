@@ -5,10 +5,12 @@ from .users import (
     create_user,
     get_user_by_email,
     get_user_by_id,
+    get_user_by_wp_id,
     get_or_create_user,
     verify_user_email,
     update_user_password,
     update_last_login,
+    sync_wordpress_user,
 )
 from .sessions import save_session_summary, get_user_sessions
 
@@ -18,10 +20,12 @@ __all__ = [
     "create_user",
     "get_user_by_email",
     "get_user_by_id",
+    "get_user_by_wp_id",
     "get_or_create_user",
     "verify_user_email",
     "update_user_password",
     "update_last_login",
+    "sync_wordpress_user",
     "save_session_summary",
     "get_user_sessions",
 ]

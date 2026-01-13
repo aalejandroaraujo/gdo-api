@@ -267,3 +267,117 @@ async def set_password_reset_token(
         )
 
         return result == "UPDATE 1"
+
+
+async def get_user_by_wp_id(wp_user_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Get user by WordPress user ID.
+
+    Args:
+        wp_user_id: WordPress user ID
+
+    Returns:
+        User dict or None if not found
+    """
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, email, display_name, account_type, email_verified,
+                   wp_user_id, freemium_limit, freemium_used,
+                   created_at, last_login
+            FROM users
+            WHERE wp_user_id = $1
+            """,
+            wp_user_id,
+        )
+
+        return dict(row) if row else None
+
+
+async def sync_wordpress_user(
+    wp_user_id: int,
+    email: str,
+    display_name: Optional[str] = None,
+    created_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Sync a WordPress user to PostgreSQL (upsert).
+
+    If user exists by wp_user_id, updates email/display_name.
+    If user exists by email, links wp_user_id.
+    Otherwise creates new user without password (they'll use forgot-password flow).
+
+    Args:
+        wp_user_id: WordPress user ID
+        email: User's email address
+        display_name: Optional display name
+        created_at: Optional WordPress registration date (ISO format)
+
+    Returns:
+        Dict with user data and sync status
+    """
+    pool = await get_pool()
+    email = email.lower().strip()
+
+    async with pool.acquire() as conn:
+        # Check if user exists by wp_user_id
+        existing_by_wp = await conn.fetchrow(
+            "SELECT id, email FROM users WHERE wp_user_id = $1",
+            wp_user_id,
+        )
+
+        if existing_by_wp:
+            # Update existing WP-linked user
+            await conn.execute(
+                """
+                UPDATE users
+                SET email = $1, display_name = COALESCE($2, display_name)
+                WHERE wp_user_id = $3
+                """,
+                email,
+                display_name,
+                wp_user_id,
+            )
+            logging.info(f"Updated existing WP user {wp_user_id}")
+            return {"user_id": str(existing_by_wp["id"]), "status": "updated"}
+
+        # Check if user exists by email
+        existing_by_email = await conn.fetchrow(
+            "SELECT id FROM users WHERE email = $1",
+            email,
+        )
+
+        if existing_by_email:
+            # Link wp_user_id to existing email user
+            await conn.execute(
+                """
+                UPDATE users
+                SET wp_user_id = $1, display_name = COALESCE($2, display_name)
+                WHERE email = $3
+                """,
+                wp_user_id,
+                display_name,
+                email,
+            )
+            logging.info(f"Linked WP user {wp_user_id} to existing email {email}")
+            return {"user_id": str(existing_by_email["id"]), "status": "linked"}
+
+        # Create new user without password
+        user_id = uuid.uuid4()
+        row = await conn.fetchrow(
+            """
+            INSERT INTO users (id, email, display_name, wp_user_id, created_at)
+            VALUES ($1, $2, $3, $4, COALESCE($5::timestamptz, NOW()))
+            RETURNING id, email, display_name, created_at
+            """,
+            user_id,
+            email,
+            display_name,
+            wp_user_id,
+            created_at,
+        )
+
+        logging.info(f"Created new user {user_id} from WP user {wp_user_id}")
+        return {"user_id": str(row["id"]), "status": "created"}

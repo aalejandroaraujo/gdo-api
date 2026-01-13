@@ -9,6 +9,7 @@ Functions:
 - register: User registration with email/password
 - login: User login with email/password
 - get_current_user: Get current user profile
+- sync_wordpress_user_endpoint: Internal endpoint for WordPress user sync
 - evaluate_intake_progress: Scores collected intake data
 - extract_fields_from_input: Extracts structured fields using OpenAI
 - risk_escalation_check: Safety screening via OpenAI moderation
@@ -37,6 +38,7 @@ from src.db import (
     update_last_login,
     save_session_summary as db_save_session_summary,
     get_user_sessions,
+    sync_wordpress_user,
 )
 from src.db.users import verify_password
 
@@ -356,6 +358,111 @@ async def get_current_user(req: func.HttpRequest) -> func.HttpResponse:
         logging.error(f"Get user error: {str(e)}")
         return func.HttpResponse(
             json.dumps({"status": "error", "message": "Failed to get user profile"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.function_name("SyncWordPressUser")
+@app.route(route="internal/sync-user", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+async def sync_wordpress_user_endpoint(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Internal endpoint for WordPress user synchronization.
+
+    This endpoint is called by WordPress when a new user registers.
+    It creates or updates the user in PostgreSQL.
+
+    Security: Protected by X-Internal-Key header (must match WP_SYNC_INTERNAL_KEY env var).
+
+    Request body:
+        {
+            "wp_user_id": 123,
+            "email": "user@example.com",
+            "display_name": "John Doe",
+            "created_at": "2026-01-13T10:00:00Z" (optional)
+        }
+
+    Response:
+        {"status": "ok", "user_id": "uuid", "sync_status": "created|updated|linked"}
+    """
+    # Verify internal key
+    internal_key = os.environ.get("WP_SYNC_INTERNAL_KEY")
+    if not internal_key:
+        logging.error("WP_SYNC_INTERNAL_KEY not configured")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Sync not configured"}),
+            status_code=503,
+            mimetype="application/json"
+        )
+
+    provided_key = req.headers.get("X-Internal-Key")
+    if not provided_key or provided_key != internal_key:
+        logging.warning("Invalid or missing X-Internal-Key header")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Unauthorized"}),
+            status_code=401,
+            mimetype="application/json"
+        )
+
+    try:
+        try:
+            req_body = req.get_json()
+        except ValueError:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid JSON"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        if not req_body:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Request body is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        wp_user_id = req_body.get("wp_user_id")
+        email = req_body.get("email", "").strip()
+        display_name = req_body.get("display_name")
+        created_at = req_body.get("created_at")
+
+        if not wp_user_id or not isinstance(wp_user_id, int):
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "wp_user_id (integer) is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        if not email or "@" not in email:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Valid email is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        result = await sync_wordpress_user(
+            wp_user_id=wp_user_id,
+            email=email,
+            display_name=display_name,
+            created_at=created_at,
+        )
+
+        logging.info(f"WordPress user sync: wp_user_id={wp_user_id}, status={result['status']}")
+
+        return func.HttpResponse(
+            json.dumps({
+                "status": "ok",
+                "user_id": result["user_id"],
+                "sync_status": result["status"]
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"WordPress sync error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Sync failed"}),
             status_code=500,
             mimetype="application/json"
         )
