@@ -58,3 +58,11 @@ infrastructure/*.log
 infrastructure/deployment-info.json
 infrastructure/schema.sql
 infrastructure/verification-report-*.txt
+
+# Internal/private documentation (not for public repo)
+docs/internal/
+
+# Deployment artifacts
+*.zip
+create_deploy_zip.py
+*.backup

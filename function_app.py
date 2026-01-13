@@ -6,10 +6,13 @@ v2 decorator model implementation consolidating all functions.
 Functions:
 - test_function: Health check endpoint
 - get_dev_token: Development token endpoint (Phase 1 auth)
+- register: User registration with email/password
+- login: User login with email/password
+- get_current_user: Get current user profile
 - evaluate_intake_progress: Scores collected intake data
 - extract_fields_from_input: Extracts structured fields using OpenAI
 - risk_escalation_check: Safety screening via OpenAI moderation
-- save_session_summary: Persists sessions to NocoDB
+- save_session_summary: Persists sessions to PostgreSQL
 - switch_chat_mode: Determines conversation mode using AI
 - mental_health_orchestrator: Durable orchestrator for the workflow
 - minimal_orchestrator: Simple test orchestrator
@@ -18,13 +21,24 @@ Functions:
 import json
 import logging
 import os
+import uuid
 from datetime import timedelta
 
 import azure.functions as func
 import azure.durable_functions as df
+import asyncpg
 
-from src.shared.common import get_openai_client, nocodb_upsert
+from src.shared.common import get_openai_client
 from src.auth import require_auth, create_token, AuthError
+from src.db import (
+    create_user,
+    get_user_by_email,
+    get_user_by_id,
+    update_last_login,
+    save_session_summary as db_save_session_summary,
+    get_user_sessions,
+)
+from src.db.users import verify_password
 
 
 # Create the Durable Functions app instance
@@ -98,6 +112,251 @@ def get_dev_token(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(
             json.dumps({"status": "error", "message": e.message}),
             status_code=e.status_code,
+            mimetype="application/json"
+        )
+
+
+@app.function_name("Register")
+@app.route(route="auth/register", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+async def register(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Register a new user with email and password.
+
+    Request body:
+        {
+            "email": "user@example.com",
+            "password": "securepassword",
+            "display_name": "John Doe" (optional)
+        }
+
+    Response:
+        {"status": "ok", "user_id": "uuid", "message": "Registration successful"}
+    """
+    try:
+        try:
+            req_body = req.get_json()
+        except ValueError:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid JSON"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        email = req_body.get("email", "").strip().lower() if req_body else ""
+        password = req_body.get("password", "") if req_body else ""
+        display_name = req_body.get("display_name", "").strip() if req_body else None
+
+        # Validation
+        if not email:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Email is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        if "@" not in email or "." not in email:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid email format"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        if not password or len(password) < 8:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Password must be at least 8 characters"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Check if user already exists
+        existing_user = await get_user_by_email(email)
+        if existing_user:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Email already registered"}),
+                status_code=409,
+                mimetype="application/json"
+            )
+
+        # Create user
+        user = await create_user(email, password, display_name)
+
+        logging.info(f"New user registered: {user['id']}")
+
+        return func.HttpResponse(
+            json.dumps({
+                "status": "ok",
+                "user_id": str(user["id"]),
+                "message": "Registration successful"
+            }),
+            status_code=201,
+            mimetype="application/json"
+        )
+
+    except asyncpg.UniqueViolationError:
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Email already registered"}),
+            status_code=409,
+            mimetype="application/json"
+        )
+    except Exception as e:
+        logging.error(f"Registration error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Registration failed"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.function_name("Login")
+@app.route(route="auth/login", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+async def login(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Login with email and password.
+
+    Request body:
+        {"email": "user@example.com", "password": "securepassword"}
+
+    Response:
+        {"token": "eyJ...", "expires_in": 86400, "token_type": "Bearer", "user": {...}}
+    """
+    try:
+        try:
+            req_body = req.get_json()
+        except ValueError:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid JSON"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        email = req_body.get("email", "").strip().lower() if req_body else ""
+        password = req_body.get("password", "") if req_body else ""
+
+        if not email or not password:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Email and password are required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Get user
+        user = await get_user_by_email(email)
+        if not user:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid email or password"}),
+                status_code=401,
+                mimetype="application/json"
+            )
+
+        # Verify password
+        if not user.get("password_hash") or not verify_password(password, user["password_hash"]):
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid email or password"}),
+                status_code=401,
+                mimetype="application/json"
+            )
+
+        # Update last login
+        await update_last_login(user["id"])
+
+        # Create token
+        token = create_token(str(user["id"]))
+
+        logging.info(f"User logged in: {user['id']}")
+
+        return func.HttpResponse(
+            json.dumps({
+                "token": token,
+                "expires_in": 86400,
+                "token_type": "Bearer",
+                "user": {
+                    "id": str(user["id"]),
+                    "email": user["email"],
+                    "display_name": user.get("display_name"),
+                    "account_type": user.get("account_type", "freemium"),
+                }
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Login error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Login failed"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.function_name("GetCurrentUser")
+@app.route(route="users/me", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+@require_auth
+async def get_current_user(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Get current user profile.
+
+    Requires: Bearer token authentication
+
+    Response:
+        {"status": "ok", "user": {...}, "sessions": {...}}
+    """
+    try:
+        user_id = req.user.get("sub")
+
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except (ValueError, TypeError):
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid user ID"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        user = await get_user_by_id(user_uuid)
+        if not user:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "User not found"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+
+        # Get recent sessions
+        sessions = await get_user_sessions(user_uuid, limit=5)
+
+        return func.HttpResponse(
+            json.dumps({
+                "status": "ok",
+                "user": {
+                    "id": str(user["id"]),
+                    "email": user["email"],
+                    "display_name": user.get("display_name"),
+                    "account_type": user.get("account_type", "freemium"),
+                    "email_verified": user.get("email_verified", False),
+                    "freemium_limit": user.get("freemium_limit", 5),
+                    "freemium_used": user.get("freemium_used", 0),
+                    "created_at": user["created_at"].isoformat() if user.get("created_at") else None,
+                    "last_login": user["last_login"].isoformat() if user.get("last_login") else None,
+                },
+                "recent_sessions": [
+                    {
+                        "id": str(s["id"]),
+                        "expert_name": s.get("expert_name"),
+                        "mode": s.get("mode"),
+                        "created_at": s["created_at"].isoformat() if s.get("created_at") else None,
+                    }
+                    for s in sessions
+                ]
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Get user error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Failed to get user profile"}),
+            status_code=500,
             mimetype="application/json"
         )
 
@@ -321,7 +580,7 @@ async def risk_escalation_check(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="save_session_summary", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 @require_auth
 async def save_session_summary(req: func.HttpRequest) -> func.HttpResponse:
-    """Save session summary to NocoDB."""
+    """Save session summary to PostgreSQL."""
     logging.info('Processing save_session_summary request')
 
     try:
@@ -362,9 +621,35 @@ async def save_session_summary(req: func.HttpRequest) -> func.HttpResponse:
             summary = summary[:2000]
             logging.info('Summary truncated to 2000 characters')
 
+        # Get user ID from JWT token
+        user_id = req.user.get("sub")
         try:
-            await nocodb_upsert(session_id.strip(), summary.strip())
-            logging.info('Successfully saved summary')
+            user_uuid = uuid.UUID(user_id)
+        except (ValueError, TypeError):
+            # For backwards compatibility with dev tokens that use non-UUID user_ids
+            # Try to find or create user by the string ID
+            logging.warning(f"Non-UUID user_id in token: {user_id}")
+            user_uuid = None
+
+        try:
+            if user_uuid:
+                await db_save_session_summary(session_id.strip(), user_uuid, summary.strip())
+            else:
+                # Fallback: save without user association (legacy support)
+                from src.db.postgres import get_pool
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        INSERT INTO sessions (id, convo_id, summary, created_at, updated_at)
+                        VALUES (gen_random_uuid(), $1, $2, NOW(), NOW())
+                        ON CONFLICT (convo_id) DO UPDATE SET summary = $2, updated_at = NOW()
+                        """,
+                        session_id.strip(),
+                        summary.strip(),
+                    )
+
+            logging.info('Successfully saved summary to PostgreSQL')
 
             return func.HttpResponse(
                 json.dumps({"status": "ok"}),
@@ -375,7 +660,7 @@ async def save_session_summary(req: func.HttpRequest) -> func.HttpResponse:
         except Exception as e:
             logging.error(f'Failed to save summary: {str(e)}')
             return func.HttpResponse(
-                json.dumps({"status": "error", "message": "NocoDB request failed."}),
+                json.dumps({"status": "error", "message": "Database request failed."}),
                 status_code=500,
                 mimetype="application/json"
             )
