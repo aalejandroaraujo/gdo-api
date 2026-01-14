@@ -231,8 +231,8 @@ async def set_verification_token(
             """
             UPDATE users
             SET verification_token = $1,
-                verification_expires = NOW() + INTERVAL '%s hours'
-            WHERE id = $2
+                verification_expires = NOW() + $2 * INTERVAL '1 hour'
+            WHERE id = $3
             """,
             token,
             expires_hours,
@@ -258,8 +258,8 @@ async def set_password_reset_token(
             """
             UPDATE users
             SET password_reset_token = $1,
-                password_reset_expires = NOW() + INTERVAL '%s hours'
-            WHERE email = $2
+                password_reset_expires = NOW() + $2 * INTERVAL '1 hour'
+            WHERE email = $3
             """,
             token,
             expires_hours,
@@ -381,3 +381,61 @@ async def sync_wordpress_user(
 
         logging.info(f"Created new user {user_id} from WP user {wp_user_id}")
         return {"user_id": str(row["id"]), "status": "created"}
+
+
+async def get_user_by_reset_token(token: str) -> Optional[Dict[str, Any]]:
+    """
+    Get user by password reset token if not expired.
+
+    Args:
+        token: Password reset token
+
+    Returns:
+        User dict or None if not found or expired
+    """
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, email, display_name
+            FROM users
+            WHERE password_reset_token = $1
+              AND password_reset_expires > NOW()
+            """,
+            token,
+        )
+
+        return dict(row) if row else None
+
+
+async def update_user_profile(
+    user_id: uuid.UUID,
+    display_name: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Update user profile fields.
+
+    Args:
+        user_id: User UUID
+        display_name: New display name (if provided)
+
+    Returns:
+        Updated user dict or None if not found
+    """
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE users
+            SET display_name = COALESCE($2, display_name)
+            WHERE id = $1
+            RETURNING id, email, display_name, account_type, email_verified,
+                      freemium_limit, freemium_used, created_at, last_login
+            """,
+            user_id,
+            display_name,
+        )
+
+        return dict(row) if row else None

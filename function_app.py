@@ -35,9 +35,14 @@ from src.db import (
     create_user,
     get_user_by_email,
     get_user_by_id,
+    get_user_by_reset_token,
     update_last_login,
+    update_user_password,
+    update_user_profile,
+    set_password_reset_token,
     save_session_summary as db_save_session_summary,
     get_user_sessions,
+    create_session,
     sync_wordpress_user,
 )
 from src.db.users import verify_password
@@ -358,6 +363,302 @@ async def get_current_user(req: func.HttpRequest) -> func.HttpResponse:
         logging.error(f"Get user error: {str(e)}")
         return func.HttpResponse(
             json.dumps({"status": "error", "message": "Failed to get user profile"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.function_name("UpdateCurrentUser")
+@app.route(route="users/me", methods=["PATCH"], auth_level=func.AuthLevel.ANONYMOUS)
+@require_auth
+async def update_current_user(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Update current user profile.
+
+    Requires: Bearer token authentication
+
+    Request body:
+        {"display_name": "New Name"}
+
+    Response:
+        {"status": "ok", "user": {...}}
+    """
+    try:
+        user_id = req.user.get("sub")
+
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except (ValueError, TypeError):
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid user ID"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        try:
+            req_body = req.get_json()
+        except ValueError:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid JSON"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        if not req_body:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Request body is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        display_name = req_body.get("display_name")
+
+        if display_name is not None and (not isinstance(display_name, str) or len(display_name.strip()) == 0):
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "display_name must be a non-empty string"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        user = await update_user_profile(user_uuid, display_name=display_name.strip() if display_name else None)
+
+        if not user:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "User not found"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+
+        return func.HttpResponse(
+            json.dumps({
+                "status": "ok",
+                "user": {
+                    "id": str(user["id"]),
+                    "email": user["email"],
+                    "display_name": user.get("display_name"),
+                    "account_type": user.get("account_type", "freemium"),
+                    "email_verified": user.get("email_verified", False),
+                }
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Update user error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Failed to update user profile"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.function_name("ForgotPassword")
+@app.route(route="auth/forgot-password", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+async def forgot_password(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Request password reset.
+
+    Request body:
+        {"email": "user@example.com"}
+
+    Response:
+        {"status": "ok", "message": "If the email exists, a reset link will be sent"}
+
+    Note: Always returns success to prevent email enumeration.
+    In production, this would send an email with the reset token.
+    """
+    try:
+        try:
+            req_body = req.get_json()
+        except ValueError:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid JSON"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        email = req_body.get("email", "").strip().lower() if req_body else ""
+
+        if not email or "@" not in email:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Valid email is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Generate reset token
+        import secrets
+        reset_token = secrets.token_urlsafe(32)
+
+        # Try to set the token (will fail silently if email doesn't exist)
+        user_exists = await set_password_reset_token(email, reset_token, expires_hours=1)
+
+        if user_exists:
+            # TODO: Send email with reset link
+            # For now, log the token (remove in production!)
+            logging.info(f"Password reset token for {email}: {reset_token}")
+
+        # Always return success to prevent email enumeration
+        return func.HttpResponse(
+            json.dumps({
+                "status": "ok",
+                "message": "If the email exists, a reset link will be sent"
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Forgot password error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Request failed"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.function_name("ResetPassword")
+@app.route(route="auth/reset-password", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+async def reset_password(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Reset password using token.
+
+    Request body:
+        {"token": "reset-token", "password": "newpassword123"}
+
+    Response:
+        {"status": "ok", "message": "Password reset successfully"}
+    """
+    try:
+        try:
+            req_body = req.get_json()
+        except ValueError:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid JSON"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        if not req_body:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Request body is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        token = req_body.get("token", "").strip()
+        password = req_body.get("password", "")
+
+        if not token:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Reset token is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        if not password or len(password) < 8:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Password must be at least 8 characters"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Validate token and get user
+        user = await get_user_by_reset_token(token)
+        if not user:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid or expired reset token"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Update password
+        success = await update_user_password(user["id"], password)
+        if not success:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Failed to update password"}),
+                status_code=500,
+                mimetype="application/json"
+            )
+
+        logging.info(f"Password reset for user: {user['id']}")
+
+        return func.HttpResponse(
+            json.dumps({
+                "status": "ok",
+                "message": "Password reset successfully"
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Reset password error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Password reset failed"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.function_name("CreateSession")
+@app.route(route="sessions", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+@require_auth
+async def create_session_endpoint(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Start a new chat session.
+
+    Requires: Bearer token authentication
+
+    Request body (optional):
+        {"session_type": "freemium"}  // freemium, paid, test
+
+    Response:
+        {"status": "ok", "session": {"id": "uuid", "mode": "intake", ...}}
+    """
+    try:
+        user_id = req.user.get("sub")
+
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except (ValueError, TypeError):
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid user ID"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        try:
+            req_body = req.get_json()
+        except ValueError:
+            req_body = {}
+
+        session_type = req_body.get("session_type", "freemium") if req_body else "freemium"
+
+        if session_type not in ["freemium", "paid", "test"]:
+            session_type = "freemium"
+
+        session = await create_session(user_uuid, session_type=session_type)
+
+        return func.HttpResponse(
+            json.dumps({
+                "status": "ok",
+                "session": {
+                    "id": str(session["id"]),
+                    "mode": session.get("mode", "intake"),
+                    "session_type": session.get("session_type", "freemium"),
+                    "created_at": session["created_at"].isoformat() if session.get("created_at") else None,
+                }
+            }),
+            status_code=201,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Create session error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Failed to create session"}),
             status_code=500,
             mimetype="application/json"
         )
