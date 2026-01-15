@@ -15,7 +15,19 @@ from .users import (
     set_password_reset_token,
     sync_wordpress_user,
 )
-from .sessions import save_session_summary, get_user_sessions, create_session
+from .sessions import (
+    save_session_summary,
+    get_user_sessions,
+    create_session,
+    get_session_by_id,
+    update_session_status,
+    end_session,
+)
+from .credits import (
+    get_user_credits,
+    consume_session_credit,
+    add_paid_credits,
+)
 
 __all__ = [
     "get_pool",
@@ -35,4 +47,10 @@ __all__ = [
     "save_session_summary",
     "get_user_sessions",
     "create_session",
+    "get_session_by_id",
+    "update_session_status",
+    "end_session",
+    "get_user_credits",
+    "consume_session_credit",
+    "add_paid_credits",
 ]

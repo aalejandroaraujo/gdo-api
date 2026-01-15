@@ -43,9 +43,15 @@ from src.db import (
     save_session_summary as db_save_session_summary,
     get_user_sessions,
     create_session,
+    get_session_by_id,
+    update_session_status,
+    end_session,
+    get_user_credits,
+    consume_session_credit,
     sync_wordpress_user,
 )
 from src.db.users import verify_password
+from datetime import datetime, timezone
 
 
 # Create the Durable Functions app instance
@@ -607,15 +613,37 @@ async def reset_password(req: func.HttpRequest) -> func.HttpResponse:
 @require_auth
 async def create_session_endpoint(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Start a new chat session.
+    Start a new chat session with timer.
 
     Requires: Bearer token authentication
 
-    Request body (optional):
-        {"session_type": "freemium"}  // freemium, paid, test
+    Consumes a session credit (free first, then paid).
+    Returns 402 if no credits available.
 
-    Response:
-        {"status": "ok", "session": {"id": "uuid", "mode": "intake", ...}}
+    Request body (optional):
+        {"expert_id": "uuid"}
+
+    Response (201):
+        {
+            "status": "ok",
+            "session": {
+                "id": "uuid",
+                "mode": "intake",
+                "session_type": "freemium",
+                "duration_minutes": 5,
+                "started_at": "2026-01-15T23:00:00Z",
+                "expires_at": "2026-01-15T23:05:00Z",
+                "status": "active"
+            }
+        }
+
+    Error (402):
+        {
+            "error": "NO_CREDITS",
+            "message": "No sessions available. Please purchase more.",
+            "free_remaining": 0,
+            "paid_remaining": 0
+        }
     """
     try:
         user_id = req.user.get("sub")
@@ -634,12 +662,38 @@ async def create_session_endpoint(req: func.HttpRequest) -> func.HttpResponse:
         except ValueError:
             req_body = {}
 
-        session_type = req_body.get("session_type", "freemium") if req_body else "freemium"
+        # Parse optional expert_id
+        expert_id = None
+        if req_body and req_body.get("expert_id"):
+            try:
+                expert_id = uuid.UUID(req_body["expert_id"])
+            except (ValueError, TypeError):
+                pass  # Invalid expert_id, ignore
 
-        if session_type not in ["freemium", "paid", "test"]:
-            session_type = "freemium"
+        # Consume a session credit (atomic operation)
+        credit_result = await consume_session_credit(user_uuid, expert_id)
 
-        session = await create_session(user_uuid, session_type=session_type)
+        if not credit_result["success"]:
+            # No credits available - return 402 Payment Required
+            credits = await get_user_credits(user_uuid)
+            return func.HttpResponse(
+                json.dumps({
+                    "error": "NO_CREDITS",
+                    "message": "No sessions available. Please purchase more.",
+                    "free_remaining": credits["free_remaining"],
+                    "paid_remaining": credits["paid_remaining"],
+                }),
+                status_code=402,
+                mimetype="application/json"
+            )
+
+        # Create session with timer
+        session = await create_session(
+            user_uuid,
+            expert_id=expert_id,
+            session_type=credit_result["session_type"],
+            duration_minutes=credit_result["duration_minutes"],
+        )
 
         return func.HttpResponse(
             json.dumps({
@@ -647,8 +701,11 @@ async def create_session_endpoint(req: func.HttpRequest) -> func.HttpResponse:
                 "session": {
                     "id": str(session["id"]),
                     "mode": session.get("mode", "intake"),
-                    "session_type": session.get("session_type", "freemium"),
-                    "created_at": session["created_at"].isoformat() if session.get("created_at") else None,
+                    "session_type": session.get("session_type"),
+                    "duration_minutes": session.get("duration_minutes"),
+                    "started_at": session["created_at"].isoformat() if session.get("created_at") else None,
+                    "expires_at": session["expires_at"].isoformat() if session.get("expires_at") else None,
+                    "status": session.get("status", "active"),
                 }
             }),
             status_code=201,
@@ -659,6 +716,256 @@ async def create_session_endpoint(req: func.HttpRequest) -> func.HttpResponse:
         logging.error(f"Create session error: {str(e)}")
         return func.HttpResponse(
             json.dumps({"status": "error", "message": "Failed to create session"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.function_name("GetSession")
+@app.route(route="sessions/{session_id}", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+@require_auth
+async def get_session_endpoint(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Get session status with remaining time.
+
+    Requires: Bearer token authentication
+
+    Response (active):
+        {
+            "session_id": "uuid",
+            "status": "active",
+            "session_type": "freemium",
+            "remaining_seconds": 187,
+            "expires_at": "2026-01-15T23:05:00Z",
+            "started_at": "2026-01-15T23:00:00Z"
+        }
+
+    Response (expired):
+        {
+            "session_id": "uuid",
+            "status": "expired",
+            "session_type": "freemium",
+            "remaining_seconds": 0,
+            "expires_at": "2026-01-15T23:05:00Z",
+            "message": "Session has expired"
+        }
+    """
+    try:
+        user_id = req.user.get("sub")
+        session_id_str = req.route_params.get("session_id")
+
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except (ValueError, TypeError):
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid user ID"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        try:
+            session_uuid = uuid.UUID(session_id_str)
+        except (ValueError, TypeError):
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid session ID"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Get session
+        session = await get_session_by_id(session_uuid)
+
+        if not session:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Session not found"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+
+        # Check ownership
+        if str(session["user_id"]) != user_id:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Not authorized"}),
+                status_code=403,
+                mimetype="application/json"
+            )
+
+        now = datetime.now(timezone.utc)
+        status = session.get("status", "active")
+        expires_at = session.get("expires_at")
+
+        # Check if expired
+        if status == "active" and expires_at and now >= expires_at:
+            status = "expired"
+            await update_session_status(session_uuid, "expired")
+
+        # Calculate remaining time
+        remaining_seconds = 0
+        if expires_at and status == "active":
+            remaining_seconds = max(0, int((expires_at - now).total_seconds()))
+
+        response = {
+            "session_id": str(session["id"]),
+            "status": status,
+            "session_type": session.get("session_type"),
+            "remaining_seconds": remaining_seconds,
+            "expires_at": expires_at.isoformat() if expires_at else None,
+            "started_at": session["created_at"].isoformat() if session.get("created_at") else None,
+        }
+
+        if status == "expired":
+            response["message"] = "Session has expired"
+
+        return func.HttpResponse(
+            json.dumps(response),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Get session error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Failed to get session"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.function_name("EndSession")
+@app.route(route="sessions/{session_id}/end", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+@require_auth
+async def end_session_endpoint(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    End a session manually.
+
+    Requires: Bearer token authentication
+
+    Response (200):
+        {
+            "session_id": "uuid",
+            "status": "ended",
+            "duration_used_seconds": 180
+        }
+    """
+    try:
+        user_id = req.user.get("sub")
+        session_id_str = req.route_params.get("session_id")
+
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except (ValueError, TypeError):
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid user ID"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        try:
+            session_uuid = uuid.UUID(session_id_str)
+        except (ValueError, TypeError):
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid session ID"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Get session to check ownership
+        session = await get_session_by_id(session_uuid)
+
+        if not session:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Session not found"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+
+        # Check ownership
+        if str(session["user_id"]) != user_id:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Not authorized"}),
+                status_code=403,
+                mimetype="application/json"
+            )
+
+        # Check if already ended
+        if session.get("status") == "ended":
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Session already ended"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # End the session
+        result = await end_session(session_uuid)
+
+        if not result:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Failed to end session"}),
+                status_code=500,
+                mimetype="application/json"
+            )
+
+        return func.HttpResponse(
+            json.dumps(result),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"End session error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Failed to end session"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.function_name("GetUserCredits")
+@app.route(route="users/credits", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+@require_auth
+async def get_user_credits_endpoint(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Get user's available session credits.
+
+    Requires: Bearer token authentication
+
+    Response (200):
+        {
+            "user_id": "uuid",
+            "free_remaining": 2,
+            "paid_remaining": 5,
+            "total_available": 7
+        }
+    """
+    try:
+        user_id = req.user.get("sub")
+
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except (ValueError, TypeError):
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid user ID"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        credits = await get_user_credits(user_uuid)
+
+        return func.HttpResponse(
+            json.dumps({
+                "user_id": user_id,
+                "free_remaining": credits["free_remaining"],
+                "paid_remaining": credits["paid_remaining"],
+                "total_available": credits["total_available"],
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Get credits error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Failed to get credits"}),
             status_code=500,
             mimetype="application/json"
         )

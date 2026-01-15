@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 
 from .postgres import get_pool
@@ -140,35 +141,46 @@ async def create_session(
     user_id: uuid.UUID,
     expert_id: Optional[uuid.UUID] = None,
     session_type: str = "freemium",
+    duration_minutes: int = 5,
 ) -> Dict[str, Any]:
     """
-    Create a new chat session.
+    Create a new chat session with timer.
 
     Args:
         user_id: User UUID
         expert_id: Optional expert UUID
         session_type: Type of session (freemium, paid, test)
+        duration_minutes: Session duration in minutes (5 for free, 45 for paid)
 
     Returns:
-        Created session dict
+        Created session dict with timer info
     """
     pool = await get_pool()
     session_id = uuid.uuid4()
+    started_at = datetime.now(timezone.utc)
+    expires_at = started_at + timedelta(minutes=duration_minutes)
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO sessions (id, user_id, expert_id, session_type, mode, created_at)
-            VALUES ($1, $2, $3, $4, 'intake', NOW())
-            RETURNING id, user_id, expert_id, mode, session_type, created_at
+            INSERT INTO sessions (
+                id, user_id, expert_id, session_type, mode,
+                duration_minutes, created_at, expires_at, status
+            )
+            VALUES ($1, $2, $3, $4, 'intake', $5, $6, $7, 'active')
+            RETURNING id, user_id, expert_id, mode, session_type,
+                      duration_minutes, created_at, expires_at, status
             """,
             session_id,
             user_id,
             expert_id,
             session_type,
+            duration_minutes,
+            started_at,
+            expires_at,
         )
 
-        logging.info(f"Created session {session_id} for user {user_id}")
+        logging.info(f"Created session {session_id} for user {user_id} (type={session_type}, duration={duration_minutes}min)")
         return dict(row)
 
 
@@ -199,12 +211,75 @@ async def update_session_mode(session_id: uuid.UUID, mode: str) -> bool:
         return result == "UPDATE 1"
 
 
-async def end_session(session_id: uuid.UUID) -> bool:
+async def end_session(session_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     """
-    Mark session as ended.
+    Mark session as ended and return duration used.
 
     Args:
         session_id: Session UUID
+
+    Returns:
+        Dict with session_id, status, duration_used_seconds or None if not found
+    """
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE sessions
+            SET mode = 'ended', status = 'ended', ended_at = NOW(), updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, status, created_at, ended_at
+            """,
+            session_id,
+        )
+
+        if row:
+            duration_used = (row["ended_at"] - row["created_at"]).total_seconds()
+            return {
+                "session_id": str(row["id"]),
+                "status": row["status"],
+                "duration_used_seconds": int(duration_used),
+            }
+
+        return None
+
+
+async def get_session_by_id(session_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+    """
+    Get session by UUID with timer info.
+
+    Args:
+        session_id: Session UUID
+
+    Returns:
+        Session dict with timer info or None if not found
+    """
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, user_id, expert_id, convo_id, mode, session_type,
+                   duration_minutes, created_at, expires_at, status,
+                   intake_fields, intake_score, summary, sentiment,
+                   duration_seconds, message_count, ended_at
+            FROM sessions
+            WHERE id = $1
+            """,
+            session_id,
+        )
+
+        return dict(row) if row else None
+
+
+async def update_session_status(session_id: uuid.UUID, status: str) -> bool:
+    """
+    Update session status.
+
+    Args:
+        session_id: Session UUID
+        status: New status (active, expired, ended)
 
     Returns:
         True if updated
@@ -215,9 +290,10 @@ async def end_session(session_id: uuid.UUID) -> bool:
         result = await conn.execute(
             """
             UPDATE sessions
-            SET mode = 'ended', ended_at = NOW(), updated_at = NOW()
-            WHERE id = $1
+            SET status = $1, updated_at = NOW()
+            WHERE id = $2
             """,
+            status,
             session_id,
         )
 
