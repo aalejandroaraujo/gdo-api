@@ -16,7 +16,7 @@ async def save_session_summary(
     Save or update session summary.
 
     Args:
-        session_id: Session identifier
+        session_id: Session identifier (UUID string or conversation ID)
         user_id: User UUID
         summary: Session summary text (truncated to 2000 chars)
     """
@@ -26,13 +26,22 @@ async def save_session_summary(
     summary = summary[:2000] if summary else ""
 
     async with pool.acquire() as conn:
-        # First, ensure session exists
-        session_uuid = await conn.fetchval(
-            """
-            SELECT id FROM sessions WHERE id = $1::uuid OR convo_id = $1
-            """,
-            session_id,
-        )
+        # Try to find session by UUID first, then by convo_id
+        session_uuid = None
+
+        # Check if session_id is a valid UUID
+        try:
+            test_uuid = uuid.UUID(session_id)
+            session_uuid = await conn.fetchval(
+                "SELECT id FROM sessions WHERE id = $1",
+                test_uuid,
+            )
+        except (ValueError, TypeError):
+            # Not a UUID, try convo_id lookup
+            session_uuid = await conn.fetchval(
+                "SELECT id FROM sessions WHERE convo_id = $1",
+                session_id,
+            )
 
         if session_uuid:
             # Update existing session
