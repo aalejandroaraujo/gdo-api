@@ -12,14 +12,15 @@ All protected endpoints require JWT Bearer token authentication.
 
 ### Getting a Token
 
-**Endpoint:** `POST /api/auth/dev-token`
+Use the login endpoint to get a token:
 
-> **Note:** This is a development endpoint. In production, tokens will be issued by Microsoft Entra External ID.
+**Endpoint:** `POST /api/auth/login`
 
 **Request:**
 ```json
 {
-  "user_id": "your-user-id"
+  "email": "user@example.com",
+  "password": "yourpassword"
 }
 ```
 
@@ -28,7 +29,13 @@ All protected endpoints require JWT Bearer token authentication.
 {
   "token": "eyJhbGciOiJIUzI1NiIs...",
   "expires_in": 86400,
-  "token_type": "Bearer"
+  "token_type": "Bearer",
+  "user": {
+    "id": "uuid",
+    "email": "user@example.com",
+    "display_name": "User Name",
+    "account_type": "freemium"
+  }
 }
 ```
 
@@ -58,12 +65,22 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/test` | GET | Health check |
+| `/api/auth/register` | POST | User registration |
+| `/api/auth/login` | POST | User login |
 | `/api/auth/dev-token` | POST | Get development token |
+| `/api/auth/forgot-password` | POST | Request password reset |
+| `/api/auth/reset-password` | POST | Reset password with token |
 
 ### Protected Endpoints (Auth Required)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
+| `/api/users/me` | GET | Get current user profile |
+| `/api/users/me` | PUT | Update current user profile |
+| `/api/users/credits` | GET | Get session credits balance |
+| `/api/sessions` | POST | Create new session (consumes credit) |
+| `/api/sessions/{id}` | GET | Get session status with timer |
+| `/api/sessions/{id}/end` | POST | End session manually |
 | `/api/extract_fields_from_input` | POST | Extract structured fields from text |
 | `/api/risk_escalation_check` | POST | Safety screening |
 | `/api/switch_chat_mode` | POST | Determine conversation mode |
@@ -71,17 +88,78 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
 | `/api/save_session_summary` | POST | Persist session summary |
 | `/api/orchestrators/{name}` | POST | Start durable orchestration |
 
+### Internal Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/internal/sync-user` | POST | WordPress user sync (internal use) |
+
 ---
 
-## Endpoint Details
+## Authentication Endpoints
 
-### GET /api/test
+### POST /api/auth/register
 
-Health check endpoint to verify the API is running.
+Register a new user account.
 
 **Authentication:** None
 
-**Response:** `Hello World! Function detected successfully!`
+**Request:**
+```json
+{
+  "email": "user@example.com",
+  "password": "SecurePass123!",
+  "name": "User Name"
+}
+```
+
+**Response (201):**
+```json
+{
+  "status": "ok",
+  "user_id": "uuid",
+  "message": "Registration successful"
+}
+```
+
+**Errors:**
+- `400` - Email already registered
+- `400` - Invalid email format
+- `400` - Password too weak
+
+---
+
+### POST /api/auth/login
+
+Authenticate and get a JWT token.
+
+**Authentication:** None
+
+**Request:**
+```json
+{
+  "email": "user@example.com",
+  "password": "SecurePass123!"
+}
+```
+
+**Response (200):**
+```json
+{
+  "token": "eyJhbGciOiJIUzI1NiIs...",
+  "expires_in": 86400,
+  "token_type": "Bearer",
+  "user": {
+    "id": "uuid",
+    "email": "user@example.com",
+    "display_name": "User Name",
+    "account_type": "freemium"
+  }
+}
+```
+
+**Errors:**
+- `401` - Invalid email or password
 
 ---
 
@@ -98,10 +176,10 @@ Generate a JWT token for development/testing.
 }
 ```
 
-**Response:**
+**Response (200):**
 ```json
 {
-  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "token": "eyJhbGciOiJIUzI1NiIs...",
   "expires_in": 86400,
   "token_type": "Bearer"
 }
@@ -113,9 +191,271 @@ Generate a JWT token for development/testing.
 
 ---
 
+### POST /api/auth/forgot-password
+
+Request a password reset email.
+
+**Authentication:** None
+
+**Request:**
+```json
+{
+  "email": "user@example.com"
+}
+```
+
+**Response (200):**
+```json
+{
+  "status": "ok",
+  "message": "If the email exists, a reset link has been sent"
+}
+```
+
+---
+
+### POST /api/auth/reset-password
+
+Reset password using token from email.
+
+**Authentication:** None
+
+**Request:**
+```json
+{
+  "token": "reset-token-from-email",
+  "new_password": "NewSecurePass123!"
+}
+```
+
+**Response (200):**
+```json
+{
+  "status": "ok",
+  "message": "Password reset successful"
+}
+```
+
+---
+
+## User Endpoints
+
+### GET /api/users/me
+
+Get current authenticated user's profile.
+
+**Authentication:** Required
+
+**Response (200):**
+```json
+{
+  "status": "ok",
+  "user": {
+    "id": "uuid",
+    "email": "user@example.com",
+    "display_name": "User Name",
+    "account_type": "freemium",
+    "email_verified": true,
+    "freemium_limit": 3,
+    "freemium_used": 1,
+    "created_at": "2026-01-15T10:00:00Z",
+    "last_login": "2026-01-16T14:30:00Z"
+  },
+  "recent_sessions": [
+    {
+      "id": "session-uuid",
+      "expert_name": "obsesiones",
+      "mode": "intake",
+      "created_at": "2026-01-16T14:00:00Z"
+    }
+  ]
+}
+```
+
+---
+
+### PUT /api/users/me
+
+Update current user's profile.
+
+**Authentication:** Required
+
+**Request:**
+```json
+{
+  "display_name": "New Name",
+  "preferences": {
+    "theme": "dark",
+    "notifications": true
+  }
+}
+```
+
+**Response (200):**
+```json
+{
+  "status": "ok",
+  "message": "Profile updated"
+}
+```
+
+---
+
+### GET /api/users/credits
+
+Get user's available session credits.
+
+**Authentication:** Required
+
+**Response (200):**
+```json
+{
+  "user_id": "uuid",
+  "free_remaining": 2,
+  "paid_remaining": 5,
+  "total_available": 7
+}
+```
+
+**Credit Types:**
+- `free_remaining` - Freemium sessions (5 minutes each, 3 per new user)
+- `paid_remaining` - Purchased sessions (45 minutes each)
+- `total_available` - Sum of free + paid
+
+---
+
+## Session Endpoints
+
+### POST /api/sessions
+
+Create a new chat session. Consumes one session credit.
+
+**Authentication:** Required
+
+**Request:** Empty body or optional expert_id
+```json
+{
+  "expert_id": "obsesiones"
+}
+```
+
+**Response (201) - Free Session:**
+```json
+{
+  "status": "ok",
+  "session": {
+    "id": "uuid",
+    "mode": "intake",
+    "session_type": "freemium",
+    "duration_minutes": 5,
+    "started_at": "2026-01-16T17:18:13Z",
+    "expires_at": "2026-01-16T17:23:13Z",
+    "status": "active"
+  }
+}
+```
+
+**Response (201) - Paid Session:**
+```json
+{
+  "status": "ok",
+  "session": {
+    "id": "uuid",
+    "mode": "intake",
+    "session_type": "paid",
+    "duration_minutes": 45,
+    "started_at": "2026-01-16T17:18:13Z",
+    "expires_at": "2026-01-16T18:03:13Z",
+    "status": "active"
+  }
+}
+```
+
+**Response (402) - No Credits:**
+```json
+{
+  "error": "NO_CREDITS",
+  "message": "No sessions available. Please purchase more.",
+  "free_remaining": 0,
+  "paid_remaining": 0
+}
+```
+
+**Session Types:**
+| Type | Duration | Source |
+|------|----------|--------|
+| `freemium` | 5 minutes | Free sessions for new users |
+| `paid` | 45 minutes | Purchased via WooCommerce |
+| `test` | 45 minutes | Test/admin-granted sessions |
+
+---
+
+### GET /api/sessions/{session_id}
+
+Get session status including timer information.
+
+**Authentication:** Required
+
+**Response (200) - Active:**
+```json
+{
+  "session_id": "uuid",
+  "status": "active",
+  "session_type": "freemium",
+  "remaining_seconds": 187,
+  "expires_at": "2026-01-16T17:23:13Z",
+  "started_at": "2026-01-16T17:18:13Z"
+}
+```
+
+**Response (200) - Expired:**
+```json
+{
+  "session_id": "uuid",
+  "status": "expired",
+  "session_type": "freemium",
+  "remaining_seconds": 0,
+  "expires_at": "2026-01-16T17:23:13Z",
+  "started_at": "2026-01-16T17:18:13Z",
+  "message": "Session has expired"
+}
+```
+
+**Status Values:**
+| Status | Description |
+|--------|-------------|
+| `active` | Session is in progress |
+| `expired` | Time limit reached |
+| `ended` | Manually ended by user |
+
+---
+
+### POST /api/sessions/{session_id}/end
+
+Manually end an active session.
+
+**Authentication:** Required
+
+**Response (200):**
+```json
+{
+  "session_id": "uuid",
+  "status": "ended",
+  "duration_used_seconds": 180
+}
+```
+
+**Errors:**
+- `404` - Session not found
+- `400` - Session already ended/expired
+
+---
+
+## AI Processing Endpoints
+
 ### POST /api/extract_fields_from_input
 
-Extracts structured mental health data from natural language using OpenAI gpt-4.1-mini.
+Extracts structured mental health data from natural language using OpenAI.
 
 **Authentication:** Required
 
@@ -127,7 +467,7 @@ Extracts structured mental health data from natural language using OpenAI gpt-4.
 }
 ```
 
-**Response:**
+**Response (200):**
 ```json
 {
   "status": "ok",
@@ -171,7 +511,7 @@ Safety screening using OpenAI moderation API.
 }
 ```
 
-**Response:**
+**Response (200):**
 ```json
 {
   "status": "ok",
@@ -191,7 +531,7 @@ Safety screening using OpenAI moderation API.
 
 ### POST /api/switch_chat_mode
 
-Determines conversation state using AI analysis (gpt-4.1-mini).
+Determines conversation state using AI analysis.
 
 **Authentication:** Required
 
@@ -203,7 +543,7 @@ Determines conversation state using AI analysis (gpt-4.1-mini).
 }
 ```
 
-**Response:**
+**Response (200):**
 ```json
 {
   "status": "ok",
@@ -244,7 +584,7 @@ Evaluates if sufficient intake data has been collected.
 }
 ```
 
-**Response:**
+**Response (200):**
 ```json
 {
   "status": "ok",
@@ -283,7 +623,7 @@ Persists session summary to the database.
 }
 ```
 
-**Response:**
+**Response (200):**
 ```json
 {
   "status": "ok"
@@ -328,26 +668,40 @@ All endpoints return errors in this format:
 |------|-------------|
 | 400 | Bad request (missing fields, invalid JSON) |
 | 401 | Unauthorized (missing or invalid token) |
+| 402 | Payment required (no session credits) |
 | 403 | Forbidden (feature disabled) |
-| 500 | Internal server error (API failures) |
+| 404 | Not found (session/user doesn't exist) |
+| 500 | Internal server error |
 
 ---
 
-## Example: Complete Authentication Flow
+## Example Flows
+
+### Complete Session Flow
 
 ```bash
-# 1. Get a token
-TOKEN=$(curl -s -X POST https://func-gdo-health-prod.azurewebsites.net/api/auth/dev-token \
+# 1. Login
+TOKEN=$(curl -s -X POST https://func-gdo-health-prod.azurewebsites.net/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"user_id": "my-user"}' | jq -r '.token')
+  -d '{"email":"user@example.com","password":"pass"}' | jq -r '.token')
 
-# 2. Call a protected endpoint
-curl -X POST https://func-gdo-health-prod.azurewebsites.net/api/evaluate_intake_progress \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"session_id": "test", "fields": {"symptoms": "anxiety"}}'
+# 2. Check credits
+curl -H "Authorization: Bearer $TOKEN" \
+  https://func-gdo-health-prod.azurewebsites.net/api/users/credits
+
+# 3. Create session
+SESSION=$(curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  https://func-gdo-health-prod.azurewebsites.net/api/sessions | jq -r '.session.id')
+
+# 4. Check session status (poll for timer)
+curl -H "Authorization: Bearer $TOKEN" \
+  https://func-gdo-health-prod.azurewebsites.net/api/sessions/$SESSION
+
+# 5. End session
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  https://func-gdo-health-prod.azurewebsites.net/api/sessions/$SESSION/end
 ```
 
 ---
 
-*Last updated: 2026-01-12*
+*Last updated: 2026-01-16*

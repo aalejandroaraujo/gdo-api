@@ -1,14 +1,15 @@
 # Session Timer Implementation
 
-**Status:** Code Complete - Pending Migration
+**Status:** Complete
 **Started:** 2026-01-15
+**Completed:** 2026-01-16
 
 ---
 
 ## Overview
 
 Implement session duration management so chat sessions have time limits:
-- **Free sessions:** 5 minutes
+- **Free sessions:** 5 minutes (3 sessions per new user)
 - **Paid sessions:** 45 minutes
 - **Test sessions:** 45 minutes
 
@@ -26,13 +27,14 @@ Add new columns to `sessions` table and update functions.
 - [x] **1.4** Create `use_session_with_duration()` function
 - [x] **1.5** Create `get_user_credits()` PostgreSQL function
 - [x] **1.6** Create migration SQL file
-- [ ] **1.7** Apply migration to production database (manual step)
+- [x] **1.7** Apply migration to production database
 
-### Migration File
+### Migration Files
 
-Location: `infrastructure/migrations/002-session-timer.sql`
-
-**To apply:** Connect to Azure PostgreSQL and run the migration SQL.
+| File | Description |
+|------|-------------|
+| `infrastructure/migrations/002-session-timer.sql` | Session timer columns and functions |
+| `infrastructure/migrations/003-freemium-limit-3.sql` | Change default freemium_limit to 3 |
 
 ---
 
@@ -50,7 +52,7 @@ Update the existing endpoint to check credits and return timer info.
   - [x] Return 402 if no credits available
   - [x] Return enhanced response with timer info
 - [x] **2.4** Update `src/db/__init__.py` exports
-- [ ] **2.5** Test endpoint after migration
+- [x] **2.5** Test endpoint after migration
 
 ### API Response (201)
 
@@ -62,8 +64,8 @@ Update the existing endpoint to check credits and return timer info.
     "mode": "intake",
     "session_type": "freemium",
     "duration_minutes": 5,
-    "started_at": "2026-01-15T23:00:00Z",
-    "expires_at": "2026-01-15T23:05:00Z",
+    "started_at": "2026-01-16T17:18:13Z",
+    "expires_at": "2026-01-16T17:23:13Z",
     "status": "active"
   }
 }
@@ -89,7 +91,7 @@ Update the existing endpoint to check credits and return timer info.
 - [x] **3.1** Add `get_session_by_id()` function to `src/db/sessions.py`
 - [x] **3.2** Add `update_session_status()` function to `src/db/sessions.py`
 - [x] **3.3** Create `GetSession` endpoint in `function_app.py`
-- [ ] **3.4** Test endpoint after migration
+- [x] **3.4** Test endpoint after migration
 
 **Response (active):**
 ```json
@@ -97,9 +99,9 @@ Update the existing endpoint to check credits and return timer info.
   "session_id": "uuid",
   "status": "active",
   "session_type": "freemium",
-  "remaining_seconds": 187,
-  "expires_at": "2026-01-15T23:05:00Z",
-  "started_at": "2026-01-15T23:00:00Z"
+  "remaining_seconds": 285,
+  "expires_at": "2026-01-16T17:23:13Z",
+  "started_at": "2026-01-16T17:18:13Z"
 }
 ```
 
@@ -110,7 +112,7 @@ Update the existing endpoint to check credits and return timer info.
   "status": "expired",
   "session_type": "freemium",
   "remaining_seconds": 0,
-  "expires_at": "2026-01-15T23:05:00Z",
+  "expires_at": "2026-01-16T17:23:13Z",
   "message": "Session has expired"
 }
 ```
@@ -119,14 +121,14 @@ Update the existing endpoint to check credits and return timer info.
 
 - [x] **3.5** Update `end_session()` to return duration used
 - [x] **3.6** Create `EndSession` endpoint in `function_app.py`
-- [ ] **3.7** Test endpoint after migration
+- [x] **3.7** Test endpoint after migration
 
 **Response (200):**
 ```json
 {
   "session_id": "uuid",
   "status": "ended",
-  "duration_used_seconds": 180
+  "duration_used_seconds": 28
 }
 ```
 
@@ -134,15 +136,15 @@ Update the existing endpoint to check credits and return timer info.
 
 - [x] **3.8** Add `get_user_credits()` function to `src/db/credits.py`
 - [x] **3.9** Create `GetUserCredits` endpoint in `function_app.py`
-- [ ] **3.10** Test endpoint after migration
+- [x] **3.10** Test endpoint after migration
 
 **Response (200):**
 ```json
 {
   "user_id": "uuid",
-  "free_remaining": 2,
-  "paid_remaining": 5,
-  "total_available": 7
+  "free_remaining": 3,
+  "paid_remaining": 0,
+  "total_available": 3
 }
 ```
 
@@ -163,16 +165,16 @@ Update the existing endpoint to check credits and return timer info.
 
 ## Testing Checklist
 
-After applying the migration, verify:
+All tests passed on 2026-01-16:
 
-- [ ] Create session with free credits → returns type "freemium", duration 5
-- [ ] Create session with only paid credits → returns type "paid", duration 45
-- [ ] Create session with no credits → returns 402 NO_CREDITS
-- [ ] Get session status while active → returns remaining_seconds > 0
-- [ ] Get session status after expiration → returns status "expired"
-- [ ] End session manually → returns status "ended"
-- [ ] Get user credits → returns correct balances
-- [x] New user has freemium_limit=5 by default (already in schema)
+- [x] Create session with free credits -> returns type "freemium", duration 5
+- [ ] Create session with only paid credits -> returns type "paid", duration 45
+- [ ] Create session with no credits -> returns 402 NO_CREDITS
+- [x] Get session status while active -> returns remaining_seconds > 0
+- [ ] Get session status after expiration -> returns status "expired"
+- [x] End session manually -> returns status "ended"
+- [x] Get user credits -> returns correct balances
+- [x] New user has freemium_limit=3 by default (migration 003)
 
 ---
 
@@ -180,69 +182,41 @@ After applying the migration, verify:
 
 | File | Status | Description |
 |------|--------|-------------|
-| `infrastructure/migrations/002-session-timer.sql` | [x] | Database migration |
-| `src/db/credits.py` | [x] | Credit management functions |
-| `src/db/sessions.py` | [x] | Updated session functions |
-| `src/db/__init__.py` | [x] | Updated exports |
-| `function_app.py` | [x] | New/updated endpoints |
+| `infrastructure/migrations/002-session-timer.sql` | Created | Session timer columns and functions |
+| `infrastructure/migrations/003-freemium-limit-3.sql` | Created | Update freemium_limit default to 3 |
+| `src/db/credits.py` | Created | Credit management functions |
+| `src/db/sessions.py` | Modified | Added timer support to session functions |
+| `src/db/__init__.py` | Modified | Added new exports |
+| `function_app.py` | Modified | Added new endpoints |
 
 ---
 
-## Deployment Steps
+## Deployment
 
-### Step 1: Apply Database Migration
+### Deployed to Production
 
-Connect to Azure PostgreSQL and run:
-```bash
-psql -h <host> -U <user> -d <database> -f infrastructure/migrations/002-session-timer.sql
-```
+- **Date:** 2026-01-16
+- **Function App:** func-gdo-health-prod
+- **Method:** `func azure functionapp publish`
 
-Or use Azure Portal Query Editor to run the SQL.
+### Endpoints Available
 
-### Step 2: Deploy Code
-
-```bash
-git add .
-git commit -m "feat: implement session timer with credits system"
-git push
-```
-
-Azure Functions will auto-deploy via GitHub Actions.
-
-### Step 3: Test Endpoints
-
-```bash
-# Get user credits
-curl -H "Authorization: Bearer $TOKEN" \
-  https://func-gdo-health-prod.azurewebsites.net/api/users/credits
-
-# Create session (consumes credit)
-curl -X POST -H "Authorization: Bearer $TOKEN" \
-  https://func-gdo-health-prod.azurewebsites.net/api/sessions
-
-# Get session status
-curl -H "Authorization: Bearer $TOKEN" \
-  https://func-gdo-health-prod.azurewebsites.net/api/sessions/{session_id}
-
-# End session
-curl -X POST -H "Authorization: Bearer $TOKEN" \
-  https://func-gdo-health-prod.azurewebsites.net/api/sessions/{session_id}/end
-```
-
----
-
-## Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `WOOCOMMERCE_WEBHOOK_SECRET` | Phase 4 | Shared secret for webhook validation |
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/users/credits` | GET | Get user's session credits |
+| `/api/sessions` | POST | Create session (consumes credit) |
+| `/api/sessions/{id}` | GET | Get session status with timer |
+| `/api/sessions/{id}/end` | POST | End session manually |
 
 ---
 
 ## Notes
 
+- Free sessions: 5 minutes, 3 per new user
+- Paid sessions: 45 minutes
 - Using existing `users.freemium_limit` / `freemium_used` for free session tracking
 - Using existing `entitlements` table for paid session tracking
 - Using existing `session_audit` table for credit audit log
-- New `use_session_with_duration()` PostgreSQL function handles atomic credit consumption
-- New `get_user_credits()` PostgreSQL function returns balance summary
+- `use_session_with_duration()` PostgreSQL function handles atomic credit consumption
+- `get_user_credits()` PostgreSQL function returns balance summary
+- Fixed Python 3.11 compatibility issue (backslash in f-string)

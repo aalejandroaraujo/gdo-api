@@ -129,9 +129,11 @@ async def add_paid_credits(
             params.append(valid_days)
 
         # Create entitlement
+        valid_until_insert = ", valid_until" if valid_days else ""
+        valid_until_value = ", NOW() + $6 * INTERVAL '1 day'" if valid_days else ""
         query = f"""
-            INSERT INTO entitlements (id, user_id, source, sessions_total, order_reference{', valid_until' if valid_days else ''})
-            VALUES ($1, $2, $3, $4, $5{', NOW() + $6 * INTERVAL \'1 day\'' if valid_days else ''})
+            INSERT INTO entitlements (id, user_id, source, sessions_total, order_reference{valid_until_insert})
+            VALUES ($1, $2, $3, $4, $5{valid_until_value})
             RETURNING id
         """
 

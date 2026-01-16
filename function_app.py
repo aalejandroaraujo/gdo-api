@@ -346,7 +346,7 @@ async def get_current_user(req: func.HttpRequest) -> func.HttpResponse:
                     "display_name": user.get("display_name"),
                     "account_type": user.get("account_type", "freemium"),
                     "email_verified": user.get("email_verified", False),
-                    "freemium_limit": user.get("freemium_limit", 5),
+                    "freemium_limit": user.get("freemium_limit", 3),
                     "freemium_used": user.get("freemium_used", 0),
                     "created_at": user["created_at"].isoformat() if user.get("created_at") else None,
                     "last_login": user["last_login"].isoformat() if user.get("last_login") else None,
