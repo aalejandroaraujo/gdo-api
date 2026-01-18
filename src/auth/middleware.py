@@ -18,7 +18,8 @@ from azure.functions import HttpRequest, HttpResponse
 # Configuration
 JWT_SECRET = os.environ.get("JWT_SIGNING_KEY", "")
 JWT_ALGORITHM = "HS256"
-TOKEN_EXPIRY_HOURS = 24
+TOKEN_EXPIRY_HOURS = 1  # 1 hour token lifetime
+TOKEN_REFRESH_THRESHOLD_MINUTES = 30  # Refresh if less than 30 min remaining
 
 
 class AuthError(Exception):
@@ -120,6 +121,46 @@ def get_current_user(req: HttpRequest) -> Optional[dict]:
     return getattr(req, "user", None)
 
 
+def should_refresh_token(payload: dict) -> bool:
+    """
+    Check if token should be refreshed (sliding expiration).
+
+    Returns True if token has less than TOKEN_REFRESH_THRESHOLD_MINUTES remaining.
+    """
+    exp_timestamp = payload.get("exp")
+    if not exp_timestamp:
+        return False
+
+    now = datetime.now(timezone.utc)
+    exp_time = datetime.fromtimestamp(exp_timestamp, tz=timezone.utc)
+    time_remaining = exp_time - now
+
+    return time_remaining < timedelta(minutes=TOKEN_REFRESH_THRESHOLD_MINUTES)
+
+
+def get_refreshed_token(payload: dict) -> Optional[str]:
+    """
+    Generate a new token if the current one needs refreshing.
+
+    Args:
+        payload: Current token payload
+
+    Returns:
+        New token string if refresh needed, None otherwise
+    """
+    if not should_refresh_token(payload):
+        return None
+
+    user_id = payload.get("sub")
+    if not user_id:
+        return None
+
+    # Preserve any extra claims from the original token
+    extra_claims = {k: v for k, v in payload.items() if k not in ("sub", "iat", "exp")}
+
+    return create_token(user_id, extra_claims if extra_claims else None)
+
+
 def require_auth(func: Callable) -> Callable:
     """
     Decorator to require authentication on an endpoint.
@@ -135,7 +176,15 @@ def require_auth(func: Callable) -> Callable:
     1. Extracts the Bearer token from Authorization header
     2. Validates the JWT signature and expiration
     3. Attaches user claims to req.user
-    4. Returns 401 if authentication fails
+    4. Checks if token needs refresh (sliding expiration)
+    5. If refresh needed, adds X-New-Token header to response
+    6. Returns 401 if authentication fails
+
+    Sliding Expiration:
+    - Tokens expire after TOKEN_EXPIRY_HOURS (1 hour)
+    - If token has < TOKEN_REFRESH_THRESHOLD_MINUTES (30 min) remaining,
+      a new token is generated and returned in X-New-Token header
+    - Client should replace stored token with new one when header is present
     """
 
     @wraps(func)
@@ -147,8 +196,28 @@ def require_auth(func: Callable) -> Callable:
             # Attach user info to request for use in handler
             req.user = payload
 
+            # Check if token needs refresh (sliding expiration)
+            new_token = get_refreshed_token(payload)
+
             # Call the actual function
-            return await func(req, *args, **kwargs)
+            response = await func(req, *args, **kwargs)
+
+            # Add refreshed token to response header if needed
+            if new_token and response.status_code < 400:
+                # Azure Functions HttpResponse doesn't support modifying headers directly
+                # We need to create a new response with the header
+                response = HttpResponse(
+                    body=response.get_body(),
+                    status_code=response.status_code,
+                    headers={
+                        "Content-Type": response.mimetype or "application/json",
+                        "X-New-Token": new_token,
+                        "X-Token-Expires-In": str(TOKEN_EXPIRY_HOURS * 3600),
+                    },
+                    mimetype=response.mimetype
+                )
+
+            return response
 
         except AuthError as e:
             logging.warning(f"Authentication failed: {e.message}")
@@ -173,6 +242,7 @@ def require_auth_sync(func: Callable) -> Callable:
     Synchronous version of require_auth decorator.
 
     Use this for non-async function handlers.
+    Includes sliding expiration support.
     """
 
     @wraps(func)
@@ -181,7 +251,26 @@ def require_auth_sync(func: Callable) -> Callable:
             token = get_token_from_header(req)
             payload = validate_token(token)
             req.user = payload
-            return func(req, *args, **kwargs)
+
+            # Check if token needs refresh (sliding expiration)
+            new_token = get_refreshed_token(payload)
+
+            response = func(req, *args, **kwargs)
+
+            # Add refreshed token to response header if needed
+            if new_token and response.status_code < 400:
+                response = HttpResponse(
+                    body=response.get_body(),
+                    status_code=response.status_code,
+                    headers={
+                        "Content-Type": response.mimetype or "application/json",
+                        "X-New-Token": new_token,
+                        "X-Token-Expires-In": str(TOKEN_EXPIRY_HOURS * 3600),
+                    },
+                    mimetype=response.mimetype
+                )
+
+            return response
 
         except AuthError as e:
             logging.warning(f"Authentication failed: {e.message}")

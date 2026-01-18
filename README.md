@@ -2,18 +2,53 @@
 
 Azure Functions backend for mental health chatbot assistance, providing structured intake assessment, safety screening, and session management.
 
+## Prerequisites
+
+- **Python 3.11** (required - Azure Functions uses 3.11)
+- **Azure Functions Core Tools** (`func` CLI)
+- **Git Bash, PowerShell, or Linux terminal**
+
 ## Quick Start
 
+### 1. Activate Virtual Environment
+
+**IMPORTANT:** Always activate `.venv311` before working with this project.
+
+**Git Bash (Windows):**
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+source .venv311/Scripts/activate
+```
 
-# Set up local environment
+**PowerShell (Windows):**
+```powershell
+.\.venv311\Scripts\Activate.ps1
+```
+
+**Linux/macOS:**
+```bash
+source .venv311/bin/activate
+```
+
+You should see `(.venv311)` in your terminal prompt when activated.
+
+### 2. Set Up Local Environment
+
+```bash
+# Copy example settings (first time only)
 cp local.settings.json.example local.settings.json
-# Edit local.settings.json with your JWT_SIGNING_KEY
+# Edit local.settings.json with your JWT_SIGNING_KEY and other secrets
+```
 
-# Run locally
+### 3. Run Locally
+
+```bash
 func start --port 9090
+```
+
+### 4. Deploy to Azure
+
+```bash
+func azure functionapp publish func-gdo-health-prod
 ```
 
 ## What It Does

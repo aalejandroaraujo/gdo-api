@@ -298,3 +298,196 @@ async def update_session_status(session_id: uuid.UUID, status: str) -> bool:
         )
 
         return result == "UPDATE 1"
+
+
+async def get_user_sessions_for_history(
+    user_id: uuid.UUID,
+    limit: int = 50,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """
+    Get user's session history with message counts and previews.
+
+    Args:
+        user_id: User UUID
+        limit: Maximum number of sessions to return
+        offset: Number of sessions to skip
+
+    Returns:
+        Dict with sessions list, total count, and has_more flag
+    """
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        # Get total count
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM sessions WHERE user_id = $1",
+            user_id,
+        )
+
+        # Get sessions with message count and last message preview
+        rows = await conn.fetch(
+            """
+            SELECT
+                s.id,
+                s.expert_id,
+                e.name as expert_name,
+                s.created_at as started_at,
+                s.ended_at,
+                s.session_type,
+                (SELECT COUNT(*) FROM conversation_turns ct WHERE ct.session_id = s.id) as message_count,
+                (SELECT SUBSTRING(ct.content, 1, 100)
+                 FROM conversation_turns ct
+                 WHERE ct.session_id = s.id
+                 ORDER BY ct.created_at DESC
+                 LIMIT 1) as last_message_preview
+            FROM sessions s
+            LEFT JOIN experts e ON s.expert_id = e.id
+            WHERE s.user_id = $1
+            ORDER BY s.created_at DESC
+            LIMIT $2 OFFSET $3
+            """,
+            user_id,
+            limit,
+            offset,
+        )
+
+        sessions = []
+        for row in rows:
+            sessions.append({
+                "id": str(row["id"]),
+                "expert_id": str(row["expert_id"]) if row["expert_id"] else None,
+                "expert_name": row["expert_name"],
+                "started_at": row["started_at"].isoformat() if row["started_at"] else None,
+                "ended_at": row["ended_at"].isoformat() if row["ended_at"] else None,
+                "message_count": row["message_count"] or 0,
+                "last_message_preview": row["last_message_preview"] or "",
+                "session_type": row["session_type"],
+            })
+
+        return {
+            "sessions": sessions,
+            "total": total or 0,
+            "has_more": (offset + limit) < (total or 0),
+        }
+
+
+async def get_session_messages(
+    session_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Get messages for a session, with ownership verification.
+
+    Args:
+        session_id: Session UUID
+        user_id: User UUID (for ownership check)
+
+    Returns:
+        List of message dicts or None if session not found or not owned by user
+    """
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        # Verify ownership
+        session_owner = await conn.fetchval(
+            "SELECT user_id FROM sessions WHERE id = $1",
+            session_id,
+        )
+
+        if session_owner is None or session_owner != user_id:
+            return None
+
+        # Get messages
+        rows = await conn.fetch(
+            """
+            SELECT id, role, content, created_at as timestamp
+            FROM conversation_turns
+            WHERE session_id = $1
+            ORDER BY created_at ASC
+            """,
+            session_id,
+        )
+
+        return [
+            {
+                "id": str(row["id"]),
+                "role": row["role"],
+                "content": row["content"],
+                "timestamp": row["timestamp"].isoformat() if row["timestamp"] else None,
+            }
+            for row in rows
+        ]
+
+
+async def delete_user_history(user_id: uuid.UUID) -> int:
+    """
+    Delete all chat history (sessions and messages) for a user.
+
+    Args:
+        user_id: User UUID
+
+    Returns:
+        Number of sessions deleted
+    """
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        # Delete sessions (conversation_turns cascade automatically)
+        result = await conn.execute(
+            "DELETE FROM sessions WHERE user_id = $1",
+            user_id,
+        )
+
+        # Parse "DELETE X" to get count
+        count = int(result.split()[-1]) if result else 0
+
+        logging.info(f"Deleted {count} sessions for user {user_id}")
+        return count
+
+
+async def get_users_pending_deletion(limit: int = 100) -> List[uuid.UUID]:
+    """
+    Get users whose history deletion is due.
+
+    Args:
+        limit: Maximum number of users to return
+
+    Returns:
+        List of user UUIDs
+    """
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id FROM users
+            WHERE store_history = FALSE
+              AND history_deletion_scheduled_at IS NOT NULL
+              AND history_deletion_scheduled_at <= NOW()
+            LIMIT $1
+            """,
+            limit,
+        )
+
+        return [row["id"] for row in rows]
+
+
+async def clear_deletion_schedule(user_id: uuid.UUID) -> None:
+    """
+    Clear the deletion schedule for a user after deletion is complete.
+
+    Args:
+        user_id: User UUID
+    """
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+            SET history_deletion_scheduled_at = NULL
+            WHERE id = $1
+            """,
+            user_id,
+        )

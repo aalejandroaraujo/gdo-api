@@ -30,7 +30,7 @@ import azure.durable_functions as df
 import asyncpg
 
 from src.shared.common import get_openai_client
-from src.auth import require_auth, create_token, AuthError
+from src.auth import require_auth, create_token, AuthError, TOKEN_EXPIRY_HOURS
 from src.db import (
     create_user,
     get_user_by_email,
@@ -49,6 +49,13 @@ from src.db import (
     get_user_credits,
     consume_session_credit,
     sync_wordpress_user,
+    get_user_preferences,
+    update_user_preferences,
+    get_user_sessions_for_history,
+    get_session_messages,
+    delete_user_history,
+    get_users_pending_deletion,
+    clear_deletion_schedule,
 )
 from src.db.users import verify_password
 from datetime import datetime, timezone
@@ -82,7 +89,7 @@ def get_dev_token(req: func.HttpRequest) -> func.HttpResponse:
         {"user_id": "test-user-123"}
 
     Response:
-        {"token": "eyJ...", "expires_in": 86400, "token_type": "Bearer"}
+        {"token": "eyJ...", "expires_in": 3600, "token_type": "Bearer"}
     """
     # Check if dev tokens are enabled (default: enabled for now)
     if os.environ.get("DISABLE_DEV_TOKENS", "").lower() == "true":
@@ -115,7 +122,7 @@ def get_dev_token(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(
             json.dumps({
                 "token": token,
-                "expires_in": 86400,
+                "expires_in": TOKEN_EXPIRY_HOURS * 3600,
                 "token_type": "Bearer"
             }),
             status_code=200,
@@ -139,7 +146,8 @@ async def register(req: func.HttpRequest) -> func.HttpResponse:
         {
             "email": "user@example.com",
             "password": "securepassword",
-            "display_name": "John Doe" (optional)
+            "display_name": "John Doe" (optional),
+            "store_history_consent": true|false (optional, default false)
         }
 
     Response:
@@ -158,6 +166,11 @@ async def register(req: func.HttpRequest) -> func.HttpResponse:
         email = req_body.get("email", "").strip().lower() if req_body else ""
         password = req_body.get("password", "") if req_body else ""
         display_name = req_body.get("display_name", "").strip() if req_body else None
+        store_history_consent = req_body.get("store_history_consent", False) if req_body else False
+
+        # Validate store_history_consent is boolean
+        if not isinstance(store_history_consent, bool):
+            store_history_consent = False
 
         # Validation
         if not email:
@@ -190,10 +203,10 @@ async def register(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
 
-        # Create user
-        user = await create_user(email, password, display_name)
+        # Create user with history consent preference
+        user = await create_user(email, password, display_name, store_history=store_history_consent)
 
-        logging.info(f"New user registered: {user['id']}")
+        logging.info(f"New user registered: {user['id']}, store_history={store_history_consent}")
 
         return func.HttpResponse(
             json.dumps({
@@ -230,7 +243,12 @@ async def login(req: func.HttpRequest) -> func.HttpResponse:
         {"email": "user@example.com", "password": "securepassword"}
 
     Response:
-        {"token": "eyJ...", "expires_in": 86400, "token_type": "Bearer", "user": {...}}
+        {"token": "eyJ...", "expires_in": 3600, "token_type": "Bearer", "user": {...}}
+
+    Token Refresh (Sliding Expiration):
+        Tokens expire in 1 hour. When making authenticated requests, if the token
+        has < 30 minutes remaining, the server returns a new token in the
+        X-New-Token response header. Client should replace stored token.
     """
     try:
         try:
@@ -280,7 +298,7 @@ async def login(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(
             json.dumps({
                 "token": token,
-                "expires_in": 86400,
+                "expires_in": TOKEN_EXPIRY_HOURS * 3600,
                 "token_type": "Bearer",
                 "user": {
                     "id": str(user["id"]),
@@ -501,9 +519,9 @@ async def forgot_password(req: func.HttpRequest) -> func.HttpResponse:
         user_exists = await set_password_reset_token(email, reset_token, expires_hours=1)
 
         if user_exists:
-            # TODO: Send email with reset link
-            # For now, log the token (remove in production!)
-            logging.info(f"Password reset token for {email}: {reset_token}")
+            # TODO: Integrate email service (SendGrid/Azure Communication Services)
+            # to send password reset link to user
+            logging.info(f"Password reset requested for {email}")
 
         # Always return success to prevent email enumeration
         return func.HttpResponse(
@@ -966,6 +984,323 @@ async def get_user_credits_endpoint(req: func.HttpRequest) -> func.HttpResponse:
         logging.error(f"Get credits error: {str(e)}")
         return func.HttpResponse(
             json.dumps({"status": "error", "message": "Failed to get credits"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.function_name("GetUserPreferences")
+@app.route(route="users/me/preferences", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+@require_auth
+async def get_user_preferences_endpoint(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Get user's chat history preferences.
+
+    Requires: Bearer token authentication
+
+    Response (200):
+        {
+            "store_history": false,
+            "store_history_changed_at": "2026-01-17T10:30:00Z",
+            "history_deletion_scheduled_at": "2026-02-16T10:30:00Z"
+        }
+    """
+    try:
+        user_id = req.user.get("sub")
+
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except (ValueError, TypeError):
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid user ID"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        preferences = await get_user_preferences(user_uuid)
+
+        if not preferences:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "User not found"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+
+        return func.HttpResponse(
+            json.dumps({
+                "store_history": preferences["store_history"],
+                "store_history_changed_at": preferences["store_history_changed_at"].isoformat() if preferences.get("store_history_changed_at") else None,
+                "history_deletion_scheduled_at": preferences["history_deletion_scheduled_at"].isoformat() if preferences.get("history_deletion_scheduled_at") else None,
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Get preferences error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Failed to get preferences"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.function_name("UpdateUserPreferences")
+@app.route(route="users/me/preferences", methods=["PATCH"], auth_level=func.AuthLevel.ANONYMOUS)
+@require_auth
+async def update_user_preferences_endpoint(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Update user's chat history preference.
+
+    Requires: Bearer token authentication
+
+    Request body:
+        {"store_history": true|false}
+
+    Response (200):
+        {
+            "store_history": true,
+            "store_history_changed_at": "2026-01-17T10:30:00Z",
+            "history_deletion_scheduled_at": null
+        }
+
+    Logic:
+    - When store_history changes from true to false: schedules deletion in 30 days
+    - When store_history changes from false to true: cancels scheduled deletion
+    """
+    try:
+        user_id = req.user.get("sub")
+
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except (ValueError, TypeError):
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid user ID"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        try:
+            req_body = req.get_json()
+        except ValueError:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid JSON"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        if not req_body or "store_history" not in req_body:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "store_history field is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        store_history = req_body.get("store_history")
+        if not isinstance(store_history, bool):
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "store_history must be a boolean"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        preferences = await update_user_preferences(user_uuid, store_history)
+
+        if not preferences:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "User not found"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+
+        return func.HttpResponse(
+            json.dumps({
+                "store_history": preferences["store_history"],
+                "store_history_changed_at": preferences["store_history_changed_at"].isoformat() if preferences.get("store_history_changed_at") else None,
+                "history_deletion_scheduled_at": preferences["history_deletion_scheduled_at"].isoformat() if preferences.get("history_deletion_scheduled_at") else None,
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Update preferences error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Failed to update preferences"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.function_name("GetUserSessionHistory")
+@app.route(route="users/me/sessions", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+@require_auth
+async def get_user_session_history_endpoint(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Get user's session history with message counts and previews.
+
+    Requires: Bearer token authentication
+
+    Query params:
+        limit: int (default 50, max 100)
+        offset: int (default 0)
+
+    Response (200) when store_history = true:
+        {
+            "sessions": [...],
+            "total": 10,
+            "has_more": false
+        }
+
+    Response (200) when store_history = false:
+        {
+            "sessions": [],
+            "total": 0,
+            "has_more": false,
+            "message": "History storage is disabled"
+        }
+    """
+    try:
+        user_id = req.user.get("sub")
+
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except (ValueError, TypeError):
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid user ID"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Check if history is enabled
+        preferences = await get_user_preferences(user_uuid)
+        if not preferences:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "User not found"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+
+        if not preferences["store_history"]:
+            return func.HttpResponse(
+                json.dumps({
+                    "sessions": [],
+                    "total": 0,
+                    "has_more": False,
+                    "message": "History storage is disabled"
+                }),
+                status_code=200,
+                mimetype="application/json"
+            )
+
+        # Parse pagination params
+        limit = min(int(req.params.get("limit", "50")), 100)
+        offset = int(req.params.get("offset", "0"))
+
+        result = await get_user_sessions_for_history(user_uuid, limit=limit, offset=offset)
+
+        return func.HttpResponse(
+            json.dumps(result),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except ValueError:
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Invalid pagination parameters"}),
+            status_code=400,
+            mimetype="application/json"
+        )
+    except Exception as e:
+        logging.error(f"Get session history error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Failed to get session history"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.function_name("GetSessionMessages")
+@app.route(route="sessions/{session_id}/messages", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+@require_auth
+async def get_session_messages_endpoint(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Get messages for a specific session.
+
+    Requires: Bearer token authentication
+
+    Response (200):
+        {
+            "session_id": "uuid",
+            "messages": [
+                {
+                    "id": "uuid",
+                    "role": "user",
+                    "content": "...",
+                    "timestamp": "2026-01-17T10:00:30Z"
+                }
+            ]
+        }
+
+    Error (404):
+        - Session not found
+        - Session belongs to different user
+        - User has store_history = false
+    """
+    try:
+        user_id = req.user.get("sub")
+        session_id_str = req.route_params.get("session_id")
+
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except (ValueError, TypeError):
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid user ID"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        try:
+            session_uuid = uuid.UUID(session_id_str)
+        except (ValueError, TypeError):
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Invalid session ID"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        # Check if history is enabled
+        preferences = await get_user_preferences(user_uuid)
+        if not preferences or not preferences["store_history"]:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Session not found or history storage disabled"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+
+        # Get messages (includes ownership check)
+        messages = await get_session_messages(session_uuid, user_uuid)
+
+        if messages is None:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "message": "Session not found or history storage disabled"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+
+        return func.HttpResponse(
+            json.dumps({
+                "session_id": str(session_uuid),
+                "messages": messages
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Get session messages error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": "Failed to get session messages"}),
             status_code=500,
             mimetype="application/json"
         )
@@ -1532,3 +1867,56 @@ async def start_orchestration(req: func.HttpRequest, client: df.DurableOrchestra
     logging.info(f"Started orchestration '{function_name}' with ID = '{instance_id}'")
 
     return client.create_check_status_response(req, instance_id)
+
+
+# =============================================================================
+# TIMER FUNCTIONS - BACKGROUND JOBS
+# =============================================================================
+
+@app.function_name("HistoryDeletionJob")
+@app.timer_trigger(schedule="0 0 3 * * *", arg_name="timer", run_on_startup=False)
+async def history_deletion_job(timer: func.TimerRequest) -> None:
+    """
+    Background job to delete chat history for users who disabled storage 30+ days ago.
+
+    Runs daily at 3:00 AM UTC.
+
+    Logic:
+    1. Get users with store_history=false AND history_deletion_scheduled_at <= NOW()
+    2. Delete sessions (conversation_turns cascade automatically)
+    3. Clear history_deletion_scheduled_at
+    4. Log for audit
+    """
+    logging.info("History deletion job started")
+
+    try:
+        # Get users pending deletion (batch of 100 to avoid timeout)
+        users = await get_users_pending_deletion(limit=100)
+
+        if not users:
+            logging.info("No users pending history deletion")
+            return
+
+        logging.info(f"Found {len(users)} users pending history deletion")
+
+        total_sessions_deleted = 0
+
+        for user_id in users:
+            try:
+                # Delete sessions (cascades to conversation_turns)
+                sessions_deleted = await delete_user_history(user_id)
+                total_sessions_deleted += sessions_deleted
+
+                # Clear the deletion schedule
+                await clear_deletion_schedule(user_id)
+
+                logging.info(f"Deleted {sessions_deleted} sessions for user {user_id}")
+
+            except Exception as e:
+                logging.error(f"Error deleting history for user {user_id}: {str(e)}")
+                # Continue with next user
+
+        logging.info(f"History deletion job completed. Deleted {total_sessions_deleted} sessions for {len(users)} users")
+
+    except Exception as e:
+        logging.error(f"History deletion job failed: {str(e)}")

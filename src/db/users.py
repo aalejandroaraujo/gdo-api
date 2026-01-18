@@ -28,6 +28,7 @@ async def create_user(
     password: str,
     display_name: Optional[str] = None,
     wp_user_id: Optional[int] = None,
+    store_history: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new user with email/password authentication.
@@ -37,6 +38,7 @@ async def create_user(
         password: Plain text password (will be hashed)
         display_name: Optional display name
         wp_user_id: Optional WordPress user ID for sync
+        store_history: Whether to store chat history (default False)
 
     Returns:
         Dict with user data (id, email, display_name, created_at)
@@ -51,8 +53,8 @@ async def create_user(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO users (id, email, password_hash, display_name, wp_user_id, created_at)
-            VALUES ($1, $2, $3, $4, $5, NOW())
+            INSERT INTO users (id, email, password_hash, display_name, wp_user_id, store_history, store_history_changed_at, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
             RETURNING id, email, display_name, account_type, email_verified, created_at
             """,
             user_id,
@@ -60,9 +62,10 @@ async def create_user(
             password_hash,
             display_name,
             wp_user_id,
+            store_history,
         )
 
-        logging.info(f"Created user {user_id} with email {email}")
+        logging.info(f"Created user {user_id} with email {email}, store_history={store_history}")
         return dict(row)
 
 
@@ -439,3 +442,117 @@ async def update_user_profile(
         )
 
         return dict(row) if row else None
+
+
+async def get_user_preferences(user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+    """
+    Get user's chat history preferences.
+
+    Args:
+        user_id: User UUID
+
+    Returns:
+        Dict with store_history, store_history_changed_at, history_deletion_scheduled_at
+        or None if user not found
+    """
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT store_history, store_history_changed_at, history_deletion_scheduled_at
+            FROM users
+            WHERE id = $1
+            """,
+            user_id,
+        )
+
+        if not row:
+            return None
+
+        return {
+            "store_history": row["store_history"] or False,
+            "store_history_changed_at": row["store_history_changed_at"],
+            "history_deletion_scheduled_at": row["history_deletion_scheduled_at"],
+        }
+
+
+async def update_user_preferences(
+    user_id: uuid.UUID,
+    store_history: bool,
+) -> Optional[Dict[str, Any]]:
+    """
+    Update user's chat history preference.
+
+    Handles 30-day deletion scheduling:
+    - When store_history changes from True to False: schedules deletion in 30 days
+    - When store_history changes from False to True: cancels scheduled deletion
+
+    Args:
+        user_id: User UUID
+        store_history: New store_history value
+
+    Returns:
+        Updated preferences dict or None if user not found
+    """
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        # Get current value
+        current = await conn.fetchval(
+            "SELECT store_history FROM users WHERE id = $1",
+            user_id,
+        )
+
+        if current is None:
+            return None
+
+        # Determine if we need to schedule or cancel deletion
+        if current and not store_history:
+            # Disabling history: schedule deletion in 30 days
+            row = await conn.fetchrow(
+                """
+                UPDATE users
+                SET store_history = FALSE,
+                    store_history_changed_at = NOW(),
+                    history_deletion_scheduled_at = NOW() + INTERVAL '30 days'
+                WHERE id = $1
+                RETURNING store_history, store_history_changed_at, history_deletion_scheduled_at
+                """,
+                user_id,
+            )
+        elif not current and store_history:
+            # Enabling history: cancel any scheduled deletion
+            row = await conn.fetchrow(
+                """
+                UPDATE users
+                SET store_history = TRUE,
+                    store_history_changed_at = NOW(),
+                    history_deletion_scheduled_at = NULL
+                WHERE id = $1
+                RETURNING store_history, store_history_changed_at, history_deletion_scheduled_at
+                """,
+                user_id,
+            )
+        else:
+            # No change, just update timestamp
+            row = await conn.fetchrow(
+                """
+                UPDATE users
+                SET store_history_changed_at = NOW()
+                WHERE id = $1
+                RETURNING store_history, store_history_changed_at, history_deletion_scheduled_at
+                """,
+                user_id,
+            )
+
+        if not row:
+            return None
+
+        logging.info(f"Updated preferences for user {user_id}: store_history={store_history}")
+
+        return {
+            "store_history": row["store_history"] or False,
+            "store_history_changed_at": row["store_history_changed_at"],
+            "history_deletion_scheduled_at": row["history_deletion_scheduled_at"],
+        }

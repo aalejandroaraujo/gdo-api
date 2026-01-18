@@ -1,5 +1,38 @@
 # Deployment
 
+## Virtual Environment Setup
+
+**IMPORTANT:** This project requires Python 3.11 (Azure Functions runtime version).
+
+### Activate .venv311
+
+Always activate the virtual environment before running any commands:
+
+| Terminal | Command |
+|----------|---------|
+| **Git Bash (Windows)** | `source .venv311/Scripts/activate` |
+| **PowerShell (Windows)** | `.\.venv311\Scripts\Activate.ps1` |
+| **Linux/macOS** | `source .venv311/bin/activate` |
+
+You'll see `(.venv311)` in your prompt when activated.
+
+### First-Time Setup
+
+If `.venv311` doesn't exist:
+
+```bash
+# Windows
+py -3.11 -m venv .venv311
+
+# Linux/macOS
+python3.11 -m venv .venv311
+
+# Then activate (see above) and install dependencies
+pip install -r requirements.txt
+```
+
+---
+
 ## Environment Variables
 
 ### Required
@@ -22,30 +55,38 @@
 ## Local Development
 
 ```bash
-# Create virtual environment
-python -m venv .venv
-source .venv/bin/activate  # or .venv\Scripts\activate on Windows
+# 1. Activate virtual environment (REQUIRED)
+source .venv311/Scripts/activate   # Git Bash
+# OR
+.\.venv311\Scripts\Activate.ps1    # PowerShell
 
-# Install dependencies
+# 2. Install dependencies (first time only)
 pip install -r requirements.txt
 
-# Create local.settings.json
-cat > local.settings.json << SETTINGS
+# 3. Create local.settings.json (first time only)
+cp local.settings.json.example local.settings.json
+# Edit with your actual keys
+
+# 4. Run locally
+func start --port 9090
+```
+
+### local.settings.json Template
+
+```json
 {
   "IsEncrypted": false,
   "Values": {
     "FUNCTIONS_WORKER_RUNTIME": "python",
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
-    "OPENAI_API_KEY": "your-key-here"
+    "OPENAI_API_KEY": "your-key-here",
+    "JWT_SIGNING_KEY": "your-32-char-secret-key-here",
+    "POSTGRES_CONNECTION_STRING": "postgresql://user:pass@host:5432/db"
   },
   "Host": {
     "LocalHttpPort": 9090
   }
 }
-SETTINGS
-
-# Run locally (will start on port 9090)
-func start
 ```
 
 ## Docker Deployment
@@ -73,7 +114,10 @@ Required GitHub Secrets:
 ### Via Azure CLI
 
 ```bash
-# Create Function App
+# Ensure venv is activated first!
+source .venv311/Scripts/activate  # Git Bash
+
+# Create Function App (first time only)
 az functionapp create \
   --name your-function-app \
   --resource-group your-rg \
@@ -83,8 +127,10 @@ az functionapp create \
   --functions-version 4
 
 # Deploy
-func azure functionapp publish your-function-app
+func azure functionapp publish func-gdo-health-prod
 ```
+
+**Current Production App:** `func-gdo-health-prod`
 
 ### Via Container
 

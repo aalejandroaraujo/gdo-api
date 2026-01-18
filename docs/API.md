@@ -28,7 +28,7 @@ Use the login endpoint to get a token:
 ```json
 {
   "token": "eyJhbGciOiJIUzI1NiIs...",
-  "expires_in": 86400,
+  "expires_in": 3600,
   "token_type": "Bearer",
   "user": {
     "id": "uuid",
@@ -46,6 +46,45 @@ Include the token in the `Authorization` header for all protected endpoints:
 ```
 Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
 ```
+
+### Token Expiration & Sliding Refresh
+
+Tokens use a sliding expiration mechanism for optimal security and user experience:
+
+| Setting | Value |
+|---------|-------|
+| Token lifetime | 1 hour |
+| Refresh threshold | 30 minutes remaining |
+
+**How it works:**
+
+1. Tokens expire 1 hour after creation
+2. On each authenticated API request, the server checks remaining time
+3. If token has **less than 30 minutes** remaining, a new token is generated
+4. New token is returned in response headers:
+   - `X-New-Token`: The refreshed JWT token
+   - `X-Token-Expires-In`: Seconds until new token expires (3600)
+5. Client should replace stored token with the new one
+
+**Client Implementation:**
+
+```javascript
+// Example: Axios interceptor for token refresh
+axios.interceptors.response.use((response) => {
+  const newToken = response.headers['x-new-token'];
+  if (newToken) {
+    // Store the refreshed token
+    localStorage.setItem('token', newToken);
+  }
+  return response;
+});
+```
+
+**Benefits:**
+- Users stay logged in during active sessions (no mid-session logout)
+- 1-hour window limits exposure if token is compromised
+- No separate refresh token endpoint needed
+- Seamless UX - refresh happens automatically in background
 
 ### Authentication Errors
 
@@ -77,10 +116,14 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
 |----------|--------|-------------|
 | `/api/users/me` | GET | Get current user profile |
 | `/api/users/me` | PUT | Update current user profile |
+| `/api/users/me/preferences` | GET | Get chat history preferences |
+| `/api/users/me/preferences` | PATCH | Update chat history preferences |
+| `/api/users/me/sessions` | GET | Get session history (paginated) |
 | `/api/users/credits` | GET | Get session credits balance |
 | `/api/sessions` | POST | Create new session (consumes credit) |
 | `/api/sessions/{id}` | GET | Get session status with timer |
 | `/api/sessions/{id}/end` | POST | End session manually |
+| `/api/sessions/{id}/messages` | GET | Get messages for a session |
 | `/api/extract_fields_from_input` | POST | Extract structured fields from text |
 | `/api/risk_escalation_check` | POST | Safety screening |
 | `/api/switch_chat_mode` | POST | Determine conversation mode |
@@ -109,7 +152,8 @@ Register a new user account.
 {
   "email": "user@example.com",
   "password": "SecurePass123!",
-  "name": "User Name"
+  "name": "User Name",
+  "store_history_consent": true
 }
 ```
 
@@ -147,7 +191,7 @@ Authenticate and get a JWT token.
 ```json
 {
   "token": "eyJhbGciOiJIUzI1NiIs...",
-  "expires_in": 86400,
+  "expires_in": 3600,
   "token_type": "Bearer",
   "user": {
     "id": "uuid",
@@ -180,13 +224,13 @@ Generate a JWT token for development/testing.
 ```json
 {
   "token": "eyJhbGciOiJIUzI1NiIs...",
-  "expires_in": 86400,
+  "expires_in": 3600,
   "token_type": "Bearer"
 }
 ```
 
 **Notes:**
-- Tokens expire after 24 hours
+- Tokens expire after 1 hour (with sliding refresh on authenticated requests)
 - Can be disabled via `DISABLE_DEV_TOKENS=true` environment variable
 
 ---
@@ -324,6 +368,98 @@ Get user's available session credits.
 
 ---
 
+### GET /api/users/me/preferences
+
+Get user's chat history storage preferences.
+
+**Authentication:** Required
+
+**Response (200):**
+```json
+{
+  "store_history": false,
+  "store_history_changed_at": "2026-01-17T10:30:00Z",
+  "history_deletion_scheduled_at": "2026-02-16T10:30:00Z"
+}
+```
+
+**Fields:**
+- `store_history` - Whether chat history is being stored
+- `store_history_changed_at` - When the preference was last changed
+- `history_deletion_scheduled_at` - When history will be deleted (null if not scheduled)
+
+---
+
+### PATCH /api/users/me/preferences
+
+Update user's chat history storage preference.
+
+**Authentication:** Required
+
+**Request:**
+```json
+{
+  "store_history": true
+}
+```
+
+**Response (200):**
+```json
+{
+  "store_history": true,
+  "store_history_changed_at": "2026-01-17T10:30:00Z",
+  "history_deletion_scheduled_at": null
+}
+```
+
+**Behavior:**
+- `true → false`: Schedules deletion in 30 days
+- `false → true`: Cancels scheduled deletion
+
+---
+
+### GET /api/users/me/sessions
+
+Get user's session history with message counts and previews.
+
+**Authentication:** Required
+
+**Query Parameters:**
+- `limit` - Max sessions to return (default 50, max 100)
+- `offset` - Number of sessions to skip (default 0)
+
+**Response (200) - History Enabled:**
+```json
+{
+  "sessions": [
+    {
+      "id": "session-uuid",
+      "expert_id": "expert-uuid",
+      "expert_name": "Clara Rodrigues",
+      "started_at": "2026-01-17T10:00:00Z",
+      "ended_at": "2026-01-17T10:05:00Z",
+      "message_count": 12,
+      "last_message_preview": "Gracias por tu ayuda...",
+      "session_type": "freemium"
+    }
+  ],
+  "total": 1,
+  "has_more": false
+}
+```
+
+**Response (200) - History Disabled:**
+```json
+{
+  "sessions": [],
+  "total": 0,
+  "has_more": false,
+  "message": "History storage is disabled"
+}
+```
+
+---
+
 ## Session Endpoints
 
 ### POST /api/sessions
@@ -448,6 +584,47 @@ Manually end an active session.
 **Errors:**
 - `404` - Session not found
 - `400` - Session already ended/expired
+
+---
+
+### GET /api/sessions/{session_id}/messages
+
+Get messages from a specific session.
+
+**Authentication:** Required
+
+**Response (200):**
+```json
+{
+  "session_id": "session-uuid",
+  "messages": [
+    {
+      "id": "msg-uuid",
+      "role": "user",
+      "content": "Hola, necesito ayuda...",
+      "timestamp": "2026-01-17T10:00:30Z"
+    },
+    {
+      "id": "msg-uuid-2",
+      "role": "assistant",
+      "content": "Hola, estoy aquí para ayudarte...",
+      "timestamp": "2026-01-17T10:00:45Z"
+    }
+  ]
+}
+```
+
+**Error (404):**
+Returns 404 if:
+- Session not found
+- Session belongs to another user
+- User has `store_history = false`
+
+```json
+{
+  "error": "Session not found or history storage disabled"
+}
+```
 
 ---
 
@@ -704,4 +881,4 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 
 ---
 
-*Last updated: 2026-01-16*
+*Last updated: 2026-01-18*
